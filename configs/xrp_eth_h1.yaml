@@ -1,0 +1,45 @@
+env:
+  api_key_env: MEXC_API_KEY
+  api_secret_env: MEXC_API_SECRET
+  base_url_env: MEXC_BASE_URL
+  recv_window_env: MEXC_RECV_WINDOW
+
+runtime:
+  poll_seconds: 30
+  log_level: INFO
+
+safety:
+  allow_symbols: ["XRPUSDT", "ETHUSDT"]
+  max_usdt_per_order: 50.0
+  min_usdt_per_order: 5.0
+  cooldown_seconds: 1800
+  dry_run_default: false
+
+execution:
+  default_order_type: "MARKET"
+  slippage_bps: 20
+  limit_price_buffer_bps: 10
+  time_in_force: "GTC"
+
+portfolio:
+  quote_asset: "USDT"
+  base_assets: ["XRP", "ETH"]
+  min_profit_sweep_usdt: 2.0
+  profit_sweep_to_base:
+    XRPUSDT: "XRP"
+    ETHUSDT: "ETH"
+
+strategy:
+  name: "h1_trend_pullback"
+  params:
+    timeframe: "1h"
+    candles_limit: 300
+    ema_fast: 50
+    ema_slow: 200
+    rsi_period: 14
+    rsi_buy_max: 62
+    pullback_atr_mult: 0.35
+    atr_period: 14
+    min_atr: 0.01
+    take_profit_atr: 2.2
+    stop_loss_atr: 1.6

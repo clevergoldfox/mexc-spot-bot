@@ -1,0 +1,92 @@
+# ===============================
+# Python
+# ===============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# ===============================
+# Environment & Secrets
+# ===============================
+.env
+.env.*
+*.env
+
+# API keys / configs
+config.yaml
+config.yml
+secrets.yaml
+secrets.yml
+
+# ===============================
+# Logs
+# ===============================
+logs/
+*.log
+
+# ===============================
+# Runtime / State
+# ===============================
+state/
+*.pid
+
+# ===============================
+# Caches
+# ===============================
+.cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ===============================
+# IDE / Editor
+# ===============================
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# ===============================
+# OS
+# ===============================
+.DS_Store
+Thumbs.db
+
+# ===============================
+# Notebooks / Experiments
+# ===============================
+.ipynb_checkpoints/
+notebooks/
+
+# ===============================
+# Backtests / Data
+# ===============================
+data/
+backtests/
+*.csv
+*.parquet
+
+# ===============================
+# Coverage / Testing
+# ===============================
+.coverage
+htmlcov/
+
+# ===============================
+# Docker (optional)
+# ===============================
+docker-compose.override.yml

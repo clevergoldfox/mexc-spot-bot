@@ -1,0 +1,36 @@
+env:
+  api_key_env: MEXC_API_KEY
+  api_secret_env: MEXC_API_SECRET
+
+exchange:
+  name: mexc
+  testnet: false
+
+trading:
+  symbols:
+    - XRPUSDT
+    - ETHUSDT
+  base_currency: USDT
+  position_mode: spot
+  max_positions: 2
+  trade_amount_usdt: 50
+
+strategy:
+  name: trend_pullback
+  params:
+    candles_limit: 300
+    ema_fast: 50
+    ema_slow: 200
+    rsi_period: 14
+    rsi_buy_max: 62.0
+    atr_period: 14
+    min_atr: 0.03
+    pullback_atr_mult: 0.35
+
+risk:
+  max_daily_trades: 5
+  max_drawdown_percent: 5
+
+runtime:
+  loop_interval_sec: 60
+  log_level: INFO
