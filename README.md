@@ -34,6 +34,16 @@ python -m mexc_bot run --config configs/xrp_eth_h1.yaml --dry-run
 python -m mexc_bot run --config configs/xrp_eth_h1.yaml
 ```
 
+### Backtest-style live (same logic as backtest: Eth/Xrp MQ4, BUY+SELL)
+```bash
+# Dry-run first
+python -m mexc_bot run-backtest-mode --config configs/xrp_eth_h1.yaml --dry-run
+# Live
+python -m mexc_bot run-backtest-mode --config configs/xrp_eth_h1.yaml
+```
+
+See **[OPERATION.md](OPERATION.md)** for step-by-step “how to start operating in practice” (env, config, dry-run, live, VPS).
+
 ## Notes
 - Spot exchanges typically require the bot to keep running (VPS recommended).
 - Spot does not always support native bracket orders; this template focuses on clean execution and safety.
