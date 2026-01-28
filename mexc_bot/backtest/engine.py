@@ -1,6 +1,6 @@
 # mexc_bot/backtest/engine.py
 from decimal import Decimal
-from typing import List
+from typing import List, Callable, Optional
 from mexc_bot.backtest.simulator import SpotWallet
 from mexc_bot.strategies.base import Signal
 
@@ -14,7 +14,14 @@ class BacktestEngine:
         self.strategy = strategy
         self.trade_usdt = trade_usdt
 
-    def run(self, symbol: str, klines: List[list]):
+    def run(
+        self,
+        symbol: str,
+        klines: List[list],
+        on_step: Optional[Callable[[int, int, Decimal, Decimal], None]] = None,
+        log_fn: Optional[Callable[[str], None]] = None,
+        stop_event=None,
+    ):
         """
         Replay candles one by one
         """
@@ -22,6 +29,8 @@ class BacktestEngine:
         last_sell_bar = -9999
 
         for i in range(200, len(klines)):
+            if stop_event is not None and stop_event.is_set():
+                break
             window = klines[:i]
             candle = klines[i]
 
@@ -39,7 +48,11 @@ class BacktestEngine:
                 usdt_amount = signal.size_quote if signal.size_quote else self.trade_usdt
                 self.wallet.buy(symbol, close_price, usdt_amount, ts)
                 last_buy_bar = i
-                print(f"[{i}] {symbol} BUY @ {close_price:.4f} | {signal.reason}")
+                message = f"[{i}] {symbol} BUY @ {close_price:.4f} | {signal.reason}"
+                if log_fn:
+                    log_fn(message)
+                else:
+                    print(message)
 
             elif signal and signal.side == "SELL":
                 base = symbol.replace("USDT", "")
@@ -65,13 +78,34 @@ class BacktestEngine:
                             holdings_after = self.wallet.assets.get(base, Decimal("0"))
                             avg_cost = self.wallet.get_avg_cost(symbol)
                             profit_pct = (close_price - avg_cost) / avg_cost * Decimal("100") if avg_cost > 0 else Decimal("0")
-                            print(f"[{i}] {symbol} SELL {float(sell_pct)*100:.0f}% @ {close_price:.4f} | {signal.reason} | Holdings: {holdings_before:.4f} -> {holdings_after:.4f} | Profit: {profit_pct:.1f}%")
+                            message = (
+                                f"[{i}] {symbol} SELL {float(sell_pct)*100:.0f}% @ {close_price:.4f} | "
+                                f"{signal.reason} | Holdings: {holdings_before:.4f} -> {holdings_after:.4f} | "
+                                f"Profit: {profit_pct:.1f}%"
+                            )
+                            if log_fn:
+                                log_fn(message)
+                            else:
+                                print(message)
                     else:
                         # XRP: sell 50% (working well)
                         sell_pct = Decimal("0.5")
                         self.wallet.sell_partial(symbol, close_price, sell_pct, ts)
                         holdings_after = self.wallet.assets.get(base, Decimal("0"))
-                        print(f"[{i}] {symbol} SELL {float(sell_pct)*100:.0f}% @ {close_price:.4f} | {signal.reason} | Holdings: {holdings_before:.4f} -> {holdings_after:.4f}")
+                        message = (
+                            f"[{i}] {symbol} SELL {float(sell_pct)*100:.0f}% @ {close_price:.4f} | "
+                            f"{signal.reason} | Holdings: {holdings_before:.4f} -> {holdings_after:.4f}"
+                        )
+                        if log_fn:
+                            log_fn(message)
+                        else:
+                            print(message)
                 else:
                     # No holdings to sell, skip
                     pass
+
+            base = symbol.replace("USDT", "")
+            base_qty = self.wallet.assets.get(base, Decimal("0"))
+            portfolio_value = self.wallet.usdt + base_qty * close_price
+            if on_step:
+                on_step(i, ts, close_price, portfolio_value)

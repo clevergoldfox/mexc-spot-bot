@@ -2,6 +2,7 @@
 
 import argparse
 from decimal import Decimal
+from typing import Callable, Optional
 from mexc_bot.mexc.client import MexcSpotClient
 from mexc_bot.backtest.data_provider import fetch_klines
 from mexc_bot.backtest.simulator import SpotWallet
@@ -14,14 +15,19 @@ from mexc_bot.strategies.mq4_eth_xrp import (
 )
 
 
-def run(symbols=None, years=3):
+def run(symbols=None, years=3, on_step: Optional[Callable] = None, log_fn: Optional[Callable] = None, stop_event=None):
     # Public client (no auth needed for klines)
     client = MexcSpotClient("", "")
 
     symbols = symbols or ["XRPUSDT", "ETHUSDT"]
+    results = {}
     # Backtest each symbol with its own wallet
     for symbol in symbols:
-        print(f"\n=== Backtesting {symbol} (separate wallet) ===")
+        header = f"\n=== Backtesting {symbol} (separate wallet) ==="
+        if log_fn:
+            log_fn(header)
+        else:
+            print(header)
 
         # Independent virtual wallet per symbol
         wallet = SpotWallet(initial_usdt=Decimal("1000"))
@@ -73,10 +79,16 @@ def run(symbols=None, years=3):
             limit=5000,
             max_candles=needed_candles + 1000,  # Request extra for safety
         )
-        print(f"Fetched candles: {len(klines)}")
+        if log_fn:
+            log_fn(f"Fetched candles: {len(klines)}")
+        else:
+            print(f"Fetched candles: {len(klines)}")
 
         if len(klines) < 300:
-            print("Not enough data, skipping.")
+            if log_fn:
+                log_fn("Not enough data, skipping.")
+            else:
+                print("Not enough data, skipping.")
             continue
 
         # Restrict to last N years of data
@@ -87,9 +99,20 @@ def run(symbols=None, years=3):
 
         if len(klines) > lookback_candles:
             klines = klines[-lookback_candles:]
-            print(f"Using last {lookback_candles} candles (~{years} year{'s' if years != 1 else ''})")
+            message = f"Using last {lookback_candles} candles (~{years} year{'s' if years != 1 else ''})"
+            if log_fn:
+                log_fn(message)
+            else:
+                print(message)
 
-        engine.run(symbol, klines)
+        equity_curve = []
+
+        def handle_step(index, ts, close_price, portfolio_value):
+            equity_curve.append((index, float(portfolio_value)))
+            if on_step:
+                on_step(symbol, index, ts, close_price, portfolio_value)
+
+        engine.run(symbol, klines, on_step=handle_step, log_fn=log_fn, stop_event=stop_event)
 
         # Per-symbol results: mark-to-market value in USDT for accumulation
         base = symbol.replace("USDT", "")
@@ -99,12 +122,34 @@ def run(symbols=None, years=3):
         start_capital = Decimal("1000")
         profit_pct = (portfolio_value / start_capital - Decimal("1")) * Decimal("100")
 
-        print("\n--- RESULT", symbol, "---")
-        print("Final USDT:", wallet.usdt)
-        print("Base holdings:", wallet.assets)
-        print("Portfolio value (USDT):", portfolio_value)
-        print(f"Profit % over ~{years} year{'s' if years != 1 else ''}:", profit_pct)
-        print("Trades:", len(wallet.trades))
+        if log_fn:
+            log_fn(f"\n--- RESULT {symbol} ---")
+            log_fn(f"Final USDT: {wallet.usdt}")
+            log_fn(f"Base holdings: {wallet.assets}")
+            log_fn(f"Portfolio value (USDT): {portfolio_value}")
+            log_fn(f"Profit % over ~{years} year{'s' if years != 1 else ''}: {profit_pct}")
+            log_fn(f"Trades: {len(wallet.trades)}")
+        else:
+            print("\n--- RESULT", symbol, "---")
+            print("Final USDT:", wallet.usdt)
+            print("Base holdings:", wallet.assets)
+            print("Portfolio value (USDT):", portfolio_value)
+            print(f"Profit % over ~{years} year{'s' if years != 1 else ''}:", profit_pct)
+            print("Trades:", len(wallet.trades))
+
+        results[symbol] = {
+            "final_usdt": str(wallet.usdt),
+            "base_holdings": {k: str(v) for k, v in wallet.assets.items()},
+            "portfolio_value": str(portfolio_value),
+            "profit_pct": str(profit_pct),
+            "trades": len(wallet.trades),
+            "equity_curve": equity_curve,
+        }
+
+        if stop_event is not None and stop_event.is_set():
+            break
+
+    return results
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run MEXC spot backtest (XRP H4, ETH H1).")
