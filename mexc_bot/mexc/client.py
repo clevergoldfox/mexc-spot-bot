@@ -41,7 +41,7 @@ class MexcSpotClient:
             params=params if method in ("GET", "DELETE") else None,
             data=None if method in ("GET", "DELETE") else params,
             headers=headers,
-            timeout=20
+            timeout=60
         )
 
         if resp.status_code >= 400:

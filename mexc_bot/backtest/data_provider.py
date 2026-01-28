@@ -1,5 +1,7 @@
 import time
 from typing import List
+
+import requests
 from ..mexc.client import MexcSpotClient
 
 
@@ -11,11 +13,13 @@ def fetch_klines(
     max_candles: int = 5000,
 ) -> List[list]:
     """
-    Fetch historical klines from MEXC with pagination
+    Fetch historical klines from MEXC with pagination.
+    Retries on ReadTimeout (up to 3 attempts with backoff).
     """
 
     all_klines = []
     end_time = None
+    max_retries = 3
 
     while len(all_klines) < max_candles:
         params = {
@@ -23,15 +27,22 @@ def fetch_klines(
             "interval": interval,
             "limit": limit,
         }
-
         if end_time:
             params["endTime"] = end_time
 
-        klines = client._request(
-            "GET",
-            "/api/v3/klines",
-            params=params,
-        )
+        for attempt in range(max_retries):
+            try:
+                klines = client._request(
+                    "GET",
+                    "/api/v3/klines",
+                    params=params,
+                )
+                break
+            except requests.exceptions.ReadTimeout:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** (attempt + 1))  # 2, 4, 8 sec backoff
+                else:
+                    raise
 
         if not klines:
             break

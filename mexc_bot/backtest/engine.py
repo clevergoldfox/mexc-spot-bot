@@ -5,6 +5,10 @@ from mexc_bot.backtest.simulator import SpotWallet
 from mexc_bot.strategies.base import Signal
 
 class BacktestEngine:
+    COOLDOWN_BARS = 24         # Min bars between opposite-side trades (ETH H1: 24 = 1 day)
+    ETH_BUY_SPACING_BARS = 12  # Min bars between consecutive ETH BUYs (avoid clustering)
+    ETH_SELL_SPACING_BARS = 6  # Min bars between consecutive ETH SELLs (avoid churning)
+
     def __init__(self, wallet: SpotWallet, strategy, trade_usdt: Decimal):
         self.wallet = wallet
         self.strategy = strategy
@@ -14,6 +18,9 @@ class BacktestEngine:
         """
         Replay candles one by one
         """
+        last_buy_bar = -9999
+        last_sell_bar = -9999
+
         for i in range(200, len(klines)):
             window = klines[:i]
             candle = klines[i]
@@ -24,33 +31,37 @@ class BacktestEngine:
             signal = self.strategy.generate_from_klines(symbol, window)
 
             if signal and signal.side == "BUY":
-                # Use signal.size_quote if available, otherwise fallback to trade_usdt
+                if symbol == "ETHUSDT":
+                    if (i - last_sell_bar) < self.COOLDOWN_BARS:
+                        continue
+                    if (i - last_buy_bar) < self.ETH_BUY_SPACING_BARS:
+                        continue
                 usdt_amount = signal.size_quote if signal.size_quote else self.trade_usdt
                 self.wallet.buy(symbol, close_price, usdt_amount, ts)
+                last_buy_bar = i
                 print(f"[{i}] {symbol} BUY @ {close_price:.4f} | {signal.reason}")
 
             elif signal and signal.side == "SELL":
-                # For accumulation strategy: sell partial to lock in profit
-                # while keeping some holdings for further growth
                 base = symbol.replace("USDT", "")
                 holdings_before = self.wallet.assets.get(base, Decimal("0"))
-                
+
                 if holdings_before > 0:
-                    # For ETH: very conservative selling strategy
                     if symbol == "ETHUSDT":
-                        min_holdings = Decimal("0.15")  # Minimum 0.15 ETH before selling
-                        min_profit = Decimal("0.15")  # Require 15% profit (very high threshold)
-                        
+                        if (i - last_buy_bar) < self.COOLDOWN_BARS:
+                            continue
+                        if (i - last_sell_bar) < self.ETH_SELL_SPACING_BARS:
+                            continue
+                        min_holdings = Decimal("0.10")
+                        min_profit = Decimal("0.05")   # Require 5% profit (was 10%; rarely met)
+                        sell_pct = Decimal("0.15")     # Sell 15% of holdings
+
                         if holdings_before < min_holdings:
-                            # Too small to sell, keep accumulating
                             pass
                         elif not self.wallet.is_profitable(symbol, close_price, min_profit):
-                            # Not profitable enough, skip
                             pass
                         else:
-                            # Very profitable and have enough holdings - sell only 15% (ultra conservative)
-                            sell_pct = Decimal("0.15")
                             self.wallet.sell_partial(symbol, close_price, sell_pct, ts)
+                            last_sell_bar = i
                             holdings_after = self.wallet.assets.get(base, Decimal("0"))
                             avg_cost = self.wallet.get_avg_cost(symbol)
                             profit_pct = (close_price - avg_cost) / avg_cost * Decimal("100") if avg_cost > 0 else Decimal("0")

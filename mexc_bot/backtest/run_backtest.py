@@ -1,5 +1,6 @@
 # mexc_bot/backtest/run_backtest.py
 
+import argparse
 from decimal import Decimal
 from mexc_bot.mexc.client import MexcSpotClient
 from mexc_bot.backtest.data_provider import fetch_klines
@@ -13,12 +14,13 @@ from mexc_bot.strategies.mq4_eth_xrp import (
 )
 
 
-def run():
+def run(symbols=None, years=3):
     # Public client (no auth needed for klines)
     client = MexcSpotClient("", "")
 
+    symbols = symbols or ["XRPUSDT", "ETHUSDT"]
     # Backtest each symbol with its own wallet
-    for symbol in ["XRPUSDT", "ETHUSDT"]:
+    for symbol in symbols:
         print(f"\n=== Backtesting {symbol} (separate wallet) ===")
 
         # Independent virtual wallet per symbol
@@ -30,10 +32,14 @@ def run():
             strategy = EthMq4Strategy(
                 client=None,
                 params=EthMq4Params(
-                    rsi_buy_level=35.0,  # Very selective - buy when RSI is lower (was 38.0)
-                    pullback_atr_mult=0.6,  # Tighter pullback - buy closer to EMA (was 0.7)
+                    rsi_buy_level=38.0,   # Slightly relaxed for more entries
+                    rsi_buy_ceiling=54.0, # Avoid chasing (RSI_1 < 54)
+                    rsi_sell_min=70.0,
+                    sell_require_premium=False,
+                    sell_require_downtrend=False,  # SELL on overbought reversal only
+                    pullback_atr_mult=0.6,
                 ),
-                quote_per_trade=Decimal("50"),  # Larger trades, fewer but better entries
+                quote_per_trade=Decimal("50"),
             )
             interval = "60m"  # H1
         else:  # XRPUSDT
@@ -54,11 +60,11 @@ def run():
             trade_usdt=Decimal("50") if symbol == "ETHUSDT" else Decimal("40"),  # Match quote_per_trade
         )
 
-        # Calculate how many candles we need for 3 years
+        # Calculate how many candles we need
         if symbol == "ETHUSDT":
-            needed_candles = 24 * 365 * 3  # H1 -> hours per year * 3 years
+            needed_candles = 24 * 365 * years  # H1
         else:  # XRPUSDT H4
-            needed_candles = 6 * 365 * 3  # 6 candles/day * 365 days * 3 years
+            needed_candles = 6 * 365 * years  # 6 candles/day
         
         klines = fetch_klines(
             client=client,
@@ -73,15 +79,15 @@ def run():
             print("Not enough data, skipping.")
             continue
 
-        # Restrict to last ~3 years of data (approx)
+        # Restrict to last N years of data
         if symbol == "ETHUSDT":
-            lookback_candles = 24 * 365 * 3  # H1 -> hours per year * 3 years
-        else:  # XRPUSDT H4 (~6 candles/day)
-            lookback_candles = 6 * 365 * 3  # 6 candles/day * 365 days * 3 years
+            lookback_candles = 24 * 365 * years
+        else:  # XRPUSDT H4
+            lookback_candles = 6 * 365 * years
 
         if len(klines) > lookback_candles:
             klines = klines[-lookback_candles:]
-            print(f"Using last {lookback_candles} candles (~3 years)")
+            print(f"Using last {lookback_candles} candles (~{years} year{'s' if years != 1 else ''})")
 
         engine.run(symbol, klines)
 
@@ -97,8 +103,12 @@ def run():
         print("Final USDT:", wallet.usdt)
         print("Base holdings:", wallet.assets)
         print("Portfolio value (USDT):", portfolio_value)
-        print("Profit % over ~3 years:", profit_pct)
+        print(f"Profit % over ~{years} year{'s' if years != 1 else ''}:", profit_pct)
         print("Trades:", len(wallet.trades))
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Run MEXC spot backtest (XRP H4, ETH H1).")
+    parser.add_argument("--symbols", nargs="+", default=["XRPUSDT", "ETHUSDT"], help="Symbols to backtest")
+    parser.add_argument("--years", type=int, default=3, help="Years of history (default: 3)")
+    args = parser.parse_args()
+    run(symbols=args.symbols, years=args.years)

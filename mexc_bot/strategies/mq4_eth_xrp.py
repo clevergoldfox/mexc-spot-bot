@@ -18,7 +18,11 @@ class EthMq4Params:
     ema_slow: int = 200
     rsi_period: int = 14
     rsi_buy_level: float = 45.0
+    rsi_buy_ceiling: float = 54.0   # max RSI_1 on buy (avoid chasing)
     rsi_sell_level: float = 55.0
+    rsi_sell_min: float = 72.0      # min RSI_1 to sell (strict overbought)
+    sell_require_premium: bool = False  # if False, SELL without price > EMA+0.5*ATR
+    sell_require_downtrend: bool = False  # if False, SELL on overbought reversal only (no trend filter)
     atr_period: int = 14
     pullback_atr_mult: float = 0.6  # pullbackRange = atr * 0.6
 
@@ -97,11 +101,10 @@ class EthMq4Strategy:
 
         # Final signals (buy-low, sell-high for accumulation)
         # BUY: uptrend + pullback + RSI reversal (buy the dip)
-        # More selective: require RSI to be lower (better entry)
         rsi_buy_strict = (
             (rsi_2 < self.p.rsi_buy_level)
             and (rsi_1 > rsi_2)
-            and (rsi_1 < 50.0)  # Stricter upper limit
+            and (rsi_1 < self.p.rsi_buy_ceiling)
         )
         if up_trend and price_pullback_buy and rsi_buy_strict:
             return Signal(
@@ -111,17 +114,21 @@ class EthMq4Strategy:
                 size_quote=self.quote_per_trade,
             )
 
-        # SELL: Only sell when RSI is very high (strongly overbought) to lock in profit
-        # Very conservative: require RSI > 70 (extremely overbought) and downtrend confirmed
-        # Also require price to be well above EMA fast (strong premium)
-        price_premium = close_1 > ema_fast_1 + atr * 0.5  # Price significantly above EMA
-        if down_trend and price_pullback_sell and rsi_sell and rsi_1 > 70.0 and price_premium:
-            return Signal(
-                side="SELL",
-                symbol=symbol,
-                reason="ETH MQ4: downtrend + pullback + RSI sell (strong overbought)",
-                size_quote=self.quote_per_trade,
-            )
+        # SELL: Overbought + RSI turning down (optionally require downtrend)
+        rsi_sell_min = self.p.rsi_sell_min
+        require_premium = self.p.sell_require_premium
+        require_downtrend = self.p.sell_require_downtrend
+        price_premium = close_1 > ema_fast_1 + atr * 0.5
+        trend_ok = (not require_downtrend) or down_trend
+        pullback_ok = (not require_downtrend) or price_pullback_sell
+        if trend_ok and pullback_ok and rsi_sell and rsi_1 > rsi_sell_min:
+            if (not require_premium) or price_premium:
+                return Signal(
+                    side="SELL",
+                    symbol=symbol,
+                    reason="ETH MQ4: overbought reversal (downtrend optional)",
+                    size_quote=self.quote_per_trade,
+                )
 
         return None
 
