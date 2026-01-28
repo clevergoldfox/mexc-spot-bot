@@ -30,6 +30,21 @@ def load_portfolio(client: MexcSpotClient) -> Portfolio:
         locked[asset] = Decimal(str(b.get("locked", "0")))
     return Portfolio(free=free, locked=locked)
 
+def parse_allow_symbols(env_value: str) -> Optional[list]:
+    if not env_value:
+        return None
+    symbols = [s.strip().upper() for s in env_value.split(",") if s.strip()]
+    return symbols or None
+
+def parse_decimal_env(key: str) -> Optional[Decimal]:
+    raw = os.getenv(key)
+    if not raw:
+        return None
+    try:
+        return Decimal(raw)
+    except Exception:
+        return None
+
 @app.command()
 def run(config: str = typer.Option(..., "--config", "-c"), dry_run: bool = typer.Option(False, "--dry-run")):
     cfg = load_config(config)
@@ -55,18 +70,28 @@ def run(config: str = typer.Option(..., "--config", "-c"), dry_run: bool = typer
         profit_sweep_to_base=cfg.portfolio.profit_sweep_to_base,
     ))
 
-    last_trade_ts = {s: 0.0 for s in cfg.safety.allow_symbols}
+    allow_override = parse_allow_symbols(os.getenv("MEXC_ALLOW_SYMBOLS", ""))
+    allow_symbols = allow_override or cfg.safety.allow_symbols
+
+    trade_overrides = {}
+    budget_overrides = {}
+    for symbol in allow_symbols:
+        base = symbol.replace("USDT", "")
+        trade_overrides[symbol] = parse_decimal_env(f"MEXC_TRADE_USDT_{base}")
+        budget_overrides[symbol] = parse_decimal_env(f"MEXC_BUDGET_USDT_{base}")
+
+    last_trade_ts = {s: 0.0 for s in allow_symbols}
 
     try:
         sweeper.set_baseline(load_portfolio(client))
     except Exception as e:
         log.warning("baseline set failed: %s", e)
 
-    log.info("Bot started symbols=%s dry_run=%s", cfg.safety.allow_symbols, dry)
+    log.info("Bot started symbols=%s dry_run=%s", allow_symbols, dry)
 
     while True:
         try:
-            for symbol in cfg.safety.allow_symbols:
+            for symbol in allow_symbols:
                 if time.time() - last_trade_ts.get(symbol, 0.0) < cfg.safety.cooldown_seconds:
                     continue
 
@@ -75,9 +100,29 @@ def run(config: str = typer.Option(..., "--config", "-c"), dry_run: bool = typer
                     continue
 
                 size = Decimal(sig.size_quote)
+                override = trade_overrides.get(symbol)
+                if override is not None:
+                    size = override
                 if size < cfg.safety.min_usdt_per_order:
                     continue
                 size = min(size, Decimal(str(cfg.safety.max_usdt_per_order)))
+
+                budget = budget_overrides.get(symbol)
+                if budget is not None and budget > 0:
+                    try:
+                        portfolio = load_portfolio(client)
+                        base = symbol.replace("USDT", "")
+                        base_qty = portfolio.asset_free(base) + portfolio.asset_locked(base)
+                        if base_qty > 0:
+                            ticker = client.book_ticker(symbol)
+                            price = Decimal(str(ticker.get("bidPrice", "0")))
+                            if price > 0:
+                                holding_value = base_qty * price
+                                if holding_value >= budget:
+                                    log.info("Skip BUY %s: budget reached (%.2f/%.2f)", symbol, holding_value, budget)
+                                    continue
+                    except Exception as e:
+                        log.warning("Budget check failed for %s: %s", symbol, e)
 
                 log.info("Signal: %s %s size=%s reason=%s", sig.side, sig.symbol, size, sig.reason)
                 if sig.side == "BUY":

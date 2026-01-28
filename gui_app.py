@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 import tkinter as tk
 from tkinter import ttk
 from tkinter import scrolledtext
+import tkinter.font as tkfont
 
 import yaml
 from dotenv import dotenv_values, load_dotenv
@@ -87,6 +88,8 @@ def translate_log_line(line):
         "Backtest started": "バックテスト開始",
         "Backtest already running": "バックテストは実行中です",
         "Trading already running": "運用は実行中です",
+        "Skip BUY": "買い見送り",
+        "budget reached": "上限到達",
     }
     translated = line
     for key, value in replacements.items():
@@ -124,7 +127,7 @@ class PlotCanvas:
         self.label_y = label_y
         self.label_x = label_x
         self.series = {}
-        self.padding = (55, 15, 20, 35)
+        self.padding = (65, 30, 20, 45)
         self._last_size = (0, 0)
 
     def set_series(self, name, color):
@@ -193,8 +196,8 @@ class PlotCanvas:
             self.canvas.create_text(left - 10, y, text=f"{label_val:.0f}", font=font, anchor="e")
 
         self.canvas.create_rectangle(left, top, left + plot_w, top + plot_h, outline=axis_color)
-        self.canvas.create_text(left, top - 8, text=self.label_y, font=font, anchor="sw")
-        self.canvas.create_text(left + plot_w, top + plot_h + 25, text=self.label_x, font=font, anchor="se")
+        self.canvas.create_text(left + 4, top + 4, text=self.label_y, font=font, anchor="nw")
+        self.canvas.create_text(left + plot_w - 4, top + plot_h - 4, text=self.label_x, font=font, anchor="se")
 
         for series in self.series.values():
             points = series["points"]
@@ -222,6 +225,10 @@ class MexcGuiApp:
         self.root.title("MEXC スポットボット UI")
         self.root.geometry("1100x780")
 
+        self._style = ttk.Style()
+        self._tab_style_counter = 0
+        self._tab_font = tkfont.nametofont("TkDefaultFont")
+
         self.log_queue = queue.Queue()
         self.graph_queue = queue.Queue()
         self.trading_proc = None
@@ -238,6 +245,12 @@ class MexcGuiApp:
         self.years_var = tk.StringVar(value="3")
         self.symbol_eth_var = tk.BooleanVar(value=True)
         self.symbol_xrp_var = tk.BooleanVar(value=True)
+        self.trade_eth_var = tk.BooleanVar(value=True)
+        self.trade_xrp_var = tk.BooleanVar(value=True)
+        self.trade_eth_budget_var = tk.StringVar(value="1000")
+        self.trade_xrp_budget_var = tk.StringVar(value="1000")
+        self.trade_eth_amount_var = tk.StringVar(value="50")
+        self.trade_xrp_amount_var = tk.StringVar(value="40")
 
         self._build_ui()
         self._schedule_updates()
@@ -254,6 +267,7 @@ class MexcGuiApp:
 
         notebook = ttk.Notebook(main)
         notebook.grid(row=0, column=0, sticky="nsew")
+        self._register_notebook(notebook)
 
         settings_tab = ttk.Frame(notebook)
         results_tab = ttk.Frame(notebook)
@@ -267,11 +281,17 @@ class MexcGuiApp:
         footer.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         footer.columnconfigure(4, weight=1)
 
-        ttk.Button(footer, text="運用開始", command=self.start_trading).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(footer, text="運用停止", command=self.stop_trading).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(footer, text="バックテスト開始", command=self.start_backtest).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(footer, text="バックテスト停止", command=self.stop_backtest).grid(row=0, column=3, padx=(0, 8))
+        self.btn_start_trading = ttk.Button(footer, text="運用開始", command=self.start_trading)
+        self.btn_start_trading.grid(row=0, column=0, padx=(0, 8))
+        self.btn_stop_trading = ttk.Button(footer, text="運用停止", command=self.stop_trading)
+        self.btn_stop_trading.grid(row=0, column=1, padx=(0, 8))
+        self.btn_start_backtest = ttk.Button(footer, text="バックテスト開始", command=self.start_backtest)
+        self.btn_start_backtest.grid(row=0, column=2, padx=(0, 8))
+        self.btn_stop_backtest = ttk.Button(footer, text="バックテスト停止", command=self.stop_backtest)
+        self.btn_stop_backtest.grid(row=0, column=3, padx=(0, 8))
         ttk.Button(footer, text="終了", command=self.on_exit).grid(row=0, column=5, sticky="e")
+
+        self._update_button_states()
 
     def _build_settings_tab(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -304,8 +324,36 @@ class MexcGuiApp:
         ttk.Checkbutton(symbols_frame, text="ETH", variable=self.symbol_eth_var).grid(row=0, column=1, padx=(0, 8))
         ttk.Checkbutton(symbols_frame, text="XRP", variable=self.symbol_xrp_var).grid(row=0, column=2)
 
+        trading_frame = ttk.LabelFrame(parent, text="運用設定", padding=10)
+        trading_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+        trading_frame.columnconfigure(1, weight=1)
+        trading_frame.columnconfigure(2, weight=1)
+        trading_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(trading_frame, text="対象").grid(row=0, column=0, sticky="w")
+        ttk.Label(trading_frame, text="投資上限(USDT)").grid(row=0, column=1, sticky="w")
+        ttk.Label(trading_frame, text="1回の注文額(USDT)").grid(row=0, column=2, sticky="w")
+
+        eth_row = ttk.Frame(trading_frame)
+        eth_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        eth_row.columnconfigure(1, weight=1)
+        eth_row.columnconfigure(2, weight=1)
+
+        ttk.Checkbutton(eth_row, text="ETH を運用", variable=self.trade_eth_var).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Entry(eth_row, textvariable=self.trade_eth_budget_var, width=10).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ttk.Entry(eth_row, textvariable=self.trade_eth_amount_var, width=10).grid(row=0, column=2, sticky="w")
+
+        xrp_row = ttk.Frame(trading_frame)
+        xrp_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        xrp_row.columnconfigure(1, weight=1)
+        xrp_row.columnconfigure(2, weight=1)
+
+        ttk.Checkbutton(xrp_row, text="XRP を運用", variable=self.trade_xrp_var).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Entry(xrp_row, textvariable=self.trade_xrp_budget_var, width=10).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ttk.Entry(xrp_row, textvariable=self.trade_xrp_amount_var, width=10).grid(row=0, column=2, sticky="w")
+
         config_frame = ttk.Frame(parent, padding=(5, 0))
-        config_frame.grid(row=2, column=0, sticky="ew")
+        config_frame.grid(row=3, column=0, sticky="ew")
         ttk.Label(config_frame, text="取引設定ファイル").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(config_frame, text=str(DEFAULT_CONFIG_PATH)).grid(row=0, column=1, sticky="w")
 
@@ -323,6 +371,7 @@ class MexcGuiApp:
         graph_tabs.grid(row=0, column=0, sticky="nsew")
         graph_tabs.enable_traversal()
         graph_tabs.configure(takefocus=1)
+        self._register_notebook(graph_tabs)
 
         op_tab = ttk.Frame(graph_tabs)
         bt_tab = ttk.Frame(graph_tabs)
@@ -356,6 +405,7 @@ class MexcGuiApp:
 
         log_tabs = ttk.Notebook(lower_container)
         log_tabs.grid(row=0, column=0, sticky="nsew")
+        self._register_notebook(log_tabs)
 
         log_tab = ttk.Frame(log_tabs)
         result_tab = ttk.Frame(log_tabs)
@@ -396,10 +446,44 @@ class MexcGuiApp:
         if self.trading_proc and self.trading_proc.poll() is None:
             self.log_queue.put("運用はすでに実行中です。")
             return
+        symbols = []
+        if self.trade_eth_var.get():
+            symbols.append("ETHUSDT")
+        if self.trade_xrp_var.get():
+            symbols.append("XRPUSDT")
+        if not symbols:
+            self.log_queue.put("運用対象の通貨を選択してください。")
+            return
+        for label, value in [
+            ("ETH 投資上限", self.trade_eth_budget_var.get().strip()),
+            ("XRP 投資上限", self.trade_xrp_budget_var.get().strip()),
+            ("ETH 1回の注文額", self.trade_eth_amount_var.get().strip()),
+            ("XRP 1回の注文額", self.trade_xrp_amount_var.get().strip()),
+        ]:
+            if value:
+                try:
+                    Decimal(value)
+                except InvalidOperation:
+                    self.log_queue.put(f"{label}の入力が正しくありません。")
+                    return
         env_copy = os.environ.copy()
         env_copy["MEXC_API_KEY"] = self.api_key_var.get().strip()
         env_copy["MEXC_API_SECRET"] = self.api_secret_var.get().strip()
         env_copy["PYTHONUNBUFFERED"] = "1"
+        env_copy["MEXC_ALLOW_SYMBOLS"] = ",".join(symbols)
+
+        eth_budget = self.trade_eth_budget_var.get().strip()
+        xrp_budget = self.trade_xrp_budget_var.get().strip()
+        eth_trade = self.trade_eth_amount_var.get().strip()
+        xrp_trade = self.trade_xrp_amount_var.get().strip()
+        if eth_budget:
+            env_copy["MEXC_BUDGET_USDT_ETH"] = eth_budget
+        if xrp_budget:
+            env_copy["MEXC_BUDGET_USDT_XRP"] = xrp_budget
+        if eth_trade:
+            env_copy["MEXC_TRADE_USDT_ETH"] = eth_trade
+        if xrp_trade:
+            env_copy["MEXC_TRADE_USDT_XRP"] = xrp_trade
         cmd = [
             sys.executable,
             "-u",
@@ -422,10 +506,12 @@ class MexcGuiApp:
             args=(self.trading_proc, self.log_queue, "[運用] "),
             daemon=True,
         ).start()
-        self.log_queue.put("運用を開始しました。")
+        self.log_queue.put(f"運用を開始しました。対象={symbols}")
+        self._update_button_states()
 
     def stop_trading(self):
         self.trading_proc = terminate_process(self.trading_proc, self.log_queue, "運用")
+        self._update_button_states()
 
     def start_backtest(self):
         if self.backtest_thread and self.backtest_thread.is_alive():
@@ -457,6 +543,7 @@ class MexcGuiApp:
         )
         self.backtest_thread.start()
         self.log_queue.put(f"バックテストを開始しました。期間={years}年, 通貨={symbols}")
+        self._update_button_states()
 
     def _run_backtest_thread(self, symbols, years, stop_event):
         def log_fn(message):
@@ -478,18 +565,22 @@ class MexcGuiApp:
             )
         except Exception as exc:
             self.log_queue.put(f"バックテストエラー: {exc}")
+            self.root.after(0, self._update_button_states)
             return
 
         if stop_event.is_set():
             self.log_queue.put("バックテストを停止しました。")
+            self.root.after(0, self._update_button_states)
             return
 
         self._update_backtest_results(results)
+        self.root.after(0, self._update_button_states)
 
     def stop_backtest(self):
         if self.backtest_stop_event:
             self.backtest_stop_event.set()
         self.log_queue.put("バックテスト停止を要求しました。")
+        self._update_button_states()
 
     def _update_backtest_results(self, results):
         lines = ["バックテスト結果"]
@@ -514,10 +605,16 @@ class MexcGuiApp:
         self.results_text.configure(state="disabled")
 
     def _schedule_updates(self):
+        self._refresh_process_state()
         self._poll_logs()
         self._poll_graph_updates()
         self._maybe_update_portfolio()
+        self._update_button_states()
         self.root.after(100, self._schedule_updates)
+
+    def _refresh_process_state(self):
+        if self.trading_proc and self.trading_proc.poll() is not None:
+            self.trading_proc = None
 
     def _poll_logs(self):
         while True:
@@ -623,6 +720,52 @@ class MexcGuiApp:
         self.stop_trading()
         self.stop_backtest()
         self.root.destroy()
+
+    def _update_button_states(self):
+        trading_running = self.trading_proc is not None and self.trading_proc.poll() is None
+        backtest_running = self.backtest_thread is not None and self.backtest_thread.is_alive()
+
+        if trading_running:
+            self.btn_start_trading.configure(state="disabled")
+            self.btn_stop_trading.configure(state="normal")
+        else:
+            self.btn_start_trading.configure(state="normal")
+            self.btn_stop_trading.configure(state="disabled")
+
+        if backtest_running:
+            self.btn_start_backtest.configure(state="disabled")
+            self.btn_stop_backtest.configure(state="normal")
+        else:
+            self.btn_start_backtest.configure(state="normal")
+            self.btn_stop_backtest.configure(state="disabled")
+
+    def _register_notebook(self, notebook):
+        style_name = f"CustomNotebook{self._tab_style_counter}.TNotebook"
+        tab_style = f"{style_name}.Tab"
+        self._tab_style_counter += 1
+        notebook.configure(style=style_name)
+        self._style.layout(
+            tab_style,
+            [
+                ("Notebook.tab", {"sticky": "nswe", "children": [
+                    ("Notebook.padding", {"sticky": "nswe", "children": [
+                        ("Notebook.label", {"sticky": "nswe"})
+                    ]})
+                ]})
+            ],
+        )
+
+        def _resize_tabs(event):
+            count = notebook.index("end")
+            if count <= 0:
+                return
+            width_px = max(1, event.width)
+            char_w = max(1, self._tab_font.measure("0"))
+            tab_px = max(1, width_px // count)
+            width_chars = max(6, int(tab_px / char_w) - 1)
+            self._style.configure(tab_style, width=width_chars, anchor="center")
+
+        notebook.bind("<Configure>", _resize_tabs)
 
 
 def main():
