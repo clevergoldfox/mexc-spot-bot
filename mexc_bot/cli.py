@@ -46,7 +46,11 @@ def parse_decimal_env(key: str) -> Optional[Decimal]:
         return None
 
 @app.command()
-def run(config: str = typer.Option(..., "--config", "-c"), dry_run: bool = typer.Option(False, "--dry-run")):
+def run(
+    config: str = typer.Option(..., "--config", "-c"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    stop_event=None,
+):
     cfg = load_config(config)
     setup_logging(cfg.runtime.log_level)
 
@@ -91,7 +95,13 @@ def run(config: str = typer.Option(..., "--config", "-c"), dry_run: bool = typer
 
     while True:
         try:
+            if stop_event is not None and stop_event.is_set():
+                log.info("Stopping...")
+                break
             for symbol in allow_symbols:
+                if stop_event is not None and stop_event.is_set():
+                    log.info("Stopping...")
+                    break
                 if time.time() - last_trade_ts.get(symbol, 0.0) < cfg.safety.cooldown_seconds:
                     continue
 
@@ -139,6 +149,9 @@ def run(config: str = typer.Option(..., "--config", "-c"), dry_run: bool = typer
         except Exception as e:
             log.exception("Loop error: %s", e)
 
+        if stop_event is not None and stop_event.is_set():
+            log.info("Stopping...")
+            break
         time.sleep(cfg.runtime.poll_seconds)
 
 

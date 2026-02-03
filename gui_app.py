@@ -1,9 +1,9 @@
+# -*- coding: utf-8 -*-
 import os
-import sys
 import time
 import queue
 import threading
-import subprocess
+import logging
 from pathlib import Path
 from decimal import Decimal, InvalidOperation
 import tkinter as tk
@@ -17,6 +17,7 @@ from dotenv import dotenv_values, load_dotenv
 from mexc_bot.mexc.client import MexcSpotClient
 from mexc_bot.services.cost_basis import CostBasisTracker
 from mexc_bot.backtest.run_backtest import run as run_backtest
+from mexc_bot.cli import run as run_trading
 
 
 ENV_PATH = Path(".env")
@@ -64,32 +65,32 @@ def load_allow_symbols():
 
 def translate_log_line(line):
     replacements = {
-        "Bot started": "ボット開始",
-        "Stopping": "停止中",
-        "Signal": "シグナル",
-        "BUY": "買い",
-        "SELL": "売り",
-        "price": "価格",
-        "reason": "理由",
-        "size": "サイズ",
-        "Holdings": "保有",
-        "Profit": "利益",
-        "Loop error": "ループエラー",
-        "baseline set failed": "基準設定失敗",
-        "profit sweep failed": "利益スイープ失敗",
-        "Final USDT": "最終USDT",
-        "Base holdings": "保有資産",
-        "Portfolio value (USDT)": "評価額(USDT)",
-        "Profit %": "利益率",
-        "Trades": "取引回数",
-        "Fetched candles": "取得ローソク数",
-        "Using last": "直近の本数を使用",
-        "Not enough data": "データ不足",
-        "Backtest started": "バックテスト開始",
-        "Backtest already running": "バックテストは実行中です",
-        "Trading already running": "運用は実行中です",
-        "Skip BUY": "買い見送り",
-        "budget reached": "上限到達",
+        "Bot started": "\u904b\u7528\u3092\u958b\u59cb\u3057\u307e\u3057\u305f",
+        "Stopping": "\u505c\u6b62\u4e2d",
+        "Signal": "\u30b7\u30b0\u30ca\u30eb",
+        "BUY": "\u8cb7\u3044",
+        "SELL": "\u58f2\u308a",
+        "price": "\u4fa1\u683c",
+        "reason": "\u7406\u7531",
+        "size": "\u6570\u91cf",
+        "Holdings": "\u4fdd\u6709",
+        "Profit": "\u5229\u76ca",
+        "Loop error": "\u30eb\u30fc\u30d7\u30a8\u30e9\u30fc",
+        "baseline set failed": "\u57fa\u6e96\u5024\u8a2d\u5b9a\u5931\u6557",
+        "profit sweep failed": "\u5229\u76ca\u78ba\u5b9a\u5931\u6557",
+        "Final USDT": "\u6700\u7d42USDT",
+        "Base holdings": "\u4fdd\u6709\u6570\u91cf",
+        "Portfolio value (USDT)": "\u8cc7\u7523\u5408\u8a08(USDT)",
+        "Profit %": "\u5229\u76ca\u7387",
+        "Trades": "\u53d6\u5f15\u56de\u6570",
+        "Fetched candles": "\u30ed\u30fc\u30bd\u30af\u53d6\u5f97",
+        "Using last": "\u6700\u65b0\u3092\u4f7f\u7528",
+        "Not enough data": "\u30c7\u30fc\u30bf\u4e0d\u8db3",
+        "Backtest started": "\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u958b\u59cb",
+        "Backtest already running": "\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u306f\u65e2\u306b\u5b9f\u884c\u4e2d",
+        "Trading already running": "\u904b\u7528\u306f\u65e2\u306b\u5b9f\u884c\u4e2d",
+        "Skip BUY": "\u8cb7\u3044\u3092\u30b9\u30ad\u30c3\u30d7",
+        "budget reached": "\u4e0a\u9650\u5230\u9054",
     }
     translated = line
     for key, value in replacements.items():
@@ -97,38 +98,14 @@ def translate_log_line(line):
     return translated
 
 
-def reader_thread(proc, log_queue, prefix):
-    try:
-        for line in iter(proc.stdout.readline, ""):
-            if not line:
-                break
-            translated = translate_log_line(line.rstrip())
-            log_queue.put(f"{prefix}{translated}")
-    except Exception as exc:
-        log_queue.put(f"{prefix}ログ読込エラー: {exc}")
-
-
-def terminate_process(proc, log_queue, label):
-    if not proc:
-        return None
-    if proc.poll() is None:
-        log_queue.put(f"{label}を停止します...")
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    return None
-
-
 class PlotCanvas:
-    def __init__(self, canvas, label_y, label_x):
+    def __init__(self, canvas, label_y, label_x, font=None):
         self.canvas = canvas
         self.label_y = label_y
         self.label_x = label_x
         self.series = {}
         self.padding = (65, 30, 20, 45)
-        self._last_size = (0, 0)
+        self.font = font or ("Arial", 9)
 
     def set_series(self, name, color):
         if name not in self.series:
@@ -151,7 +128,6 @@ class PlotCanvas:
         height = self.canvas.winfo_height()
         if width <= 10 or height <= 10:
             return
-        self._last_size = (width, height)
 
         self.canvas.delete("all")
         self.canvas.configure(background="#ffffff")
@@ -181,7 +157,7 @@ class PlotCanvas:
 
         grid_color = "#d9d9d9"
         axis_color = "#000000"
-        font = ("Arial", 9)
+        font = self.font
 
         for i in range(11):
             x = left + (plot_w / 10) * i
@@ -222,16 +198,19 @@ class PlotCanvas:
 class MexcGuiApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("MEXC スポットボット UI")
+        self.root.title("MEXC \u30b9\u30dd\u30c3\u30c8\u30dc\u30c3\u30c8 UI")
         self.root.geometry("1100x780")
 
         self._style = ttk.Style()
         self._tab_style_counter = 0
+        self._apply_japanese_font()
         self._tab_font = tkfont.nametofont("TkDefaultFont")
 
         self.log_queue = queue.Queue()
         self.graph_queue = queue.Queue()
-        self.trading_proc = None
+        self.trading_thread = None
+        self.trading_stop_event = None
+        self.trading_log_handler = None
         self.backtest_thread = None
         self.backtest_stop_event = None
         self.last_portfolio_fetch = 0.0
@@ -255,6 +234,31 @@ class MexcGuiApp:
         self._build_ui()
         self._schedule_updates()
 
+    def _apply_japanese_font(self):
+        preferred_fonts = ["Yu Gothic UI", "Meiryo UI", "Meiryo", "MS Gothic"]
+        available = set(tkfont.families(self.root))
+        chosen = None
+        for name in preferred_fonts:
+            if name in available:
+                chosen = name
+                break
+        if chosen is None:
+            return
+        default_font = tkfont.nametofont("TkDefaultFont")
+        default_font.configure(family=chosen, size=9)
+        for font_name in (
+            "TkTextFont",
+            "TkFixedFont",
+            "TkMenuFont",
+            "TkHeadingFont",
+            "TkCaptionFont",
+            "TkTooltipFont",
+        ):
+            try:
+                tkfont.nametofont(font_name).configure(family=chosen, size=9)
+            except tk.TclError:
+                pass
+
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
@@ -271,8 +275,8 @@ class MexcGuiApp:
 
         settings_tab = ttk.Frame(notebook)
         results_tab = ttk.Frame(notebook)
-        notebook.add(settings_tab, text="設定")
-        notebook.add(results_tab, text="結果")
+        notebook.add(settings_tab, text="\u8a2d\u5b9a")
+        notebook.add(results_tab, text="\u7d50\u679c")
 
         self._build_settings_tab(settings_tab)
         self._build_results_tab(results_tab)
@@ -281,65 +285,65 @@ class MexcGuiApp:
         footer.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         footer.columnconfigure(4, weight=1)
 
-        self.btn_start_trading = ttk.Button(footer, text="運用開始", command=self.start_trading)
+        self.btn_start_trading = ttk.Button(footer, text="\u904b\u7528\u958b\u59cb", command=self.start_trading)
         self.btn_start_trading.grid(row=0, column=0, padx=(0, 8))
-        self.btn_stop_trading = ttk.Button(footer, text="運用停止", command=self.stop_trading)
+        self.btn_stop_trading = ttk.Button(footer, text="\u904b\u7528\u505c\u6b62", command=self.stop_trading)
         self.btn_stop_trading.grid(row=0, column=1, padx=(0, 8))
-        self.btn_start_backtest = ttk.Button(footer, text="バックテスト開始", command=self.start_backtest)
+        self.btn_start_backtest = ttk.Button(footer, text="\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u958b\u59cb", command=self.start_backtest)
         self.btn_start_backtest.grid(row=0, column=2, padx=(0, 8))
-        self.btn_stop_backtest = ttk.Button(footer, text="バックテスト停止", command=self.stop_backtest)
+        self.btn_stop_backtest = ttk.Button(footer, text="\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u505c\u6b62", command=self.stop_backtest)
         self.btn_stop_backtest.grid(row=0, column=3, padx=(0, 8))
-        ttk.Button(footer, text="終了", command=self.on_exit).grid(row=0, column=5, sticky="e")
+        ttk.Button(footer, text="\u7d42\u4e86", command=self.on_exit).grid(row=0, column=5, sticky="e")
 
         self._update_button_states()
 
     def _build_settings_tab(self, parent):
         parent.columnconfigure(0, weight=1)
 
-        api_frame = ttk.LabelFrame(parent, text="API 設定", padding=10)
+        api_frame = ttk.LabelFrame(parent, text="API \u8a2d\u5b9a", padding=10)
         api_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
         api_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(api_frame, text="APIキー (MEXC_API_KEY)").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(api_frame, text="API\u30ad\u30fc (MEXC_API_KEY)").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(api_frame, textvariable=self.api_key_var).grid(row=0, column=1, sticky="ew")
 
-        ttk.Label(api_frame, text="APIシークレット (MEXC_API_SECRET)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(api_frame, text="API\u30b7\u30fc\u30af\u30ec\u30c3\u30c8 (MEXC_API_SECRET)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         ttk.Entry(api_frame, textvariable=self.api_secret_var, show="*").grid(row=1, column=1, sticky="ew", pady=(8, 0))
 
         btn_frame = ttk.Frame(api_frame)
         btn_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Button(btn_frame, text=".env 再読込", command=self.reload_env).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(btn_frame, text=".env 保存", command=self.save_env).grid(row=0, column=1)
+        ttk.Button(btn_frame, text=".env \u518d\u8aad\u8fbc", command=self.reload_env).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(btn_frame, text=".env \u4fdd\u5b58", command=self.save_env).grid(row=0, column=1)
 
-        backtest_frame = ttk.LabelFrame(parent, text="バックテスト設定", padding=10)
+        backtest_frame = ttk.LabelFrame(parent, text="\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u8a2d\u5b9a", padding=10)
         backtest_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
         backtest_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(backtest_frame, text="期間(年)").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(backtest_frame, text="\u671f\u9593(\u5e74)").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(backtest_frame, textvariable=self.years_var, width=8).grid(row=0, column=1, sticky="w")
 
         symbols_frame = ttk.Frame(backtest_frame)
         symbols_frame.grid(row=0, column=2, sticky="w", padx=(20, 0))
-        ttk.Label(symbols_frame, text="対象通貨").grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(symbols_frame, text="\u5bfe\u8c61\u901a\u8ca8").grid(row=0, column=0, padx=(0, 8))
         ttk.Checkbutton(symbols_frame, text="ETH", variable=self.symbol_eth_var).grid(row=0, column=1, padx=(0, 8))
         ttk.Checkbutton(symbols_frame, text="XRP", variable=self.symbol_xrp_var).grid(row=0, column=2)
 
-        trading_frame = ttk.LabelFrame(parent, text="運用設定", padding=10)
+        trading_frame = ttk.LabelFrame(parent, text="\u904b\u7528\u8a2d\u5b9a", padding=10)
         trading_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
         trading_frame.columnconfigure(1, weight=1)
         trading_frame.columnconfigure(2, weight=1)
         trading_frame.columnconfigure(3, weight=1)
 
-        ttk.Label(trading_frame, text="対象").grid(row=0, column=0, sticky="w")
-        ttk.Label(trading_frame, text="投資上限(USDT)").grid(row=0, column=1, sticky="w")
-        ttk.Label(trading_frame, text="1回の注文額(USDT)").grid(row=0, column=2, sticky="w")
+        ttk.Label(trading_frame, text="\u5bfe\u8c61").grid(row=0, column=0, sticky="w")
+        ttk.Label(trading_frame, text="\u6295\u8cc7\u4e0a\u9650(USDT)").grid(row=0, column=1, sticky="w")
+        ttk.Label(trading_frame, text="1\u56de\u306e\u53d6\u5f15(USDT)").grid(row=0, column=2, sticky="w")
 
         eth_row = ttk.Frame(trading_frame)
         eth_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         eth_row.columnconfigure(1, weight=1)
         eth_row.columnconfigure(2, weight=1)
 
-        ttk.Checkbutton(eth_row, text="ETH を運用", variable=self.trade_eth_var).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Checkbutton(eth_row, text="ETH \u3092\u904b\u7528", variable=self.trade_eth_var).grid(row=0, column=0, sticky="w", padx=(0, 12))
         ttk.Entry(eth_row, textvariable=self.trade_eth_budget_var, width=10).grid(row=0, column=1, sticky="w", padx=(0, 12))
         ttk.Entry(eth_row, textvariable=self.trade_eth_amount_var, width=10).grid(row=0, column=2, sticky="w")
 
@@ -348,13 +352,13 @@ class MexcGuiApp:
         xrp_row.columnconfigure(1, weight=1)
         xrp_row.columnconfigure(2, weight=1)
 
-        ttk.Checkbutton(xrp_row, text="XRP を運用", variable=self.trade_xrp_var).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Checkbutton(xrp_row, text="XRP \u3092\u904b\u7528", variable=self.trade_xrp_var).grid(row=0, column=0, sticky="w", padx=(0, 12))
         ttk.Entry(xrp_row, textvariable=self.trade_xrp_budget_var, width=10).grid(row=0, column=1, sticky="w", padx=(0, 12))
         ttk.Entry(xrp_row, textvariable=self.trade_xrp_amount_var, width=10).grid(row=0, column=2, sticky="w")
 
         config_frame = ttk.Frame(parent, padding=(5, 0))
         config_frame.grid(row=3, column=0, sticky="ew")
-        ttk.Label(config_frame, text="取引設定ファイル").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(config_frame, text="\u53d6\u5f15\u8a2d\u5b9a\u30d5\u30a1\u30a4\u30eb").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(config_frame, text=str(DEFAULT_CONFIG_PATH)).grid(row=0, column=1, sticky="w")
 
     def _build_results_tab(self, parent):
@@ -375,8 +379,8 @@ class MexcGuiApp:
 
         op_tab = ttk.Frame(graph_tabs)
         bt_tab = ttk.Frame(graph_tabs)
-        graph_tabs.add(op_tab, text="運用グラフ")
-        graph_tabs.add(bt_tab, text="バックテストグラフ")
+        graph_tabs.add(op_tab, text="\u904b\u7528\u30b0\u30e9\u30d5")
+        graph_tabs.add(bt_tab, text="\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u30b0\u30e9\u30d5")
 
         op_tab.rowconfigure(0, weight=1)
         op_tab.columnconfigure(0, weight=1)
@@ -389,9 +393,9 @@ class MexcGuiApp:
         self.bt_canvas = tk.Canvas(bt_tab, background="#ffffff", highlightthickness=0)
         self.bt_canvas.grid(row=0, column=0, sticky="nsew")
 
-        self.op_graph = PlotCanvas(self.op_canvas, "残高(USDT)", "時間")
-        self.op_graph.set_series("運用", "#1f77b4")
-        self.bt_graph = PlotCanvas(self.bt_canvas, "残高(USDT)", "バー")
+        self.op_graph = PlotCanvas(self.op_canvas, "\u6b8b\u9ad8(USDT)", "\u6642\u9593", font=self._tab_font)
+        self.op_graph.set_series("\u6b8b\u9ad8", "#1f77b4")
+        self.bt_graph = PlotCanvas(self.bt_canvas, "\u6b8b\u9ad8(USDT)", "\u6642\u9593", font=self._tab_font)
         for symbol in DEFAULT_SYMBOLS:
             self.bt_graph.set_series(symbol, self.bt_series_colors.get(symbol, "#2ca02c"))
 
@@ -409,8 +413,8 @@ class MexcGuiApp:
 
         log_tab = ttk.Frame(log_tabs)
         result_tab = ttk.Frame(log_tabs)
-        log_tabs.add(log_tab, text="ログ")
-        log_tabs.add(result_tab, text="結果")
+        log_tabs.add(log_tab, text="\u30ed\u30b0")
+        log_tabs.add(result_tab, text="\u7d50\u679c")
 
         log_tab.columnconfigure(0, weight=1)
         log_tab.rowconfigure(1, weight=1)
@@ -418,8 +422,8 @@ class MexcGuiApp:
         log_header = ttk.Frame(log_tab)
         log_header.grid(row=0, column=0, sticky="ew")
         log_header.columnconfigure(0, weight=1)
-        ttk.Label(log_header, text="ログ表示").grid(row=0, column=0, sticky="w")
-        ttk.Button(log_header, text="ログクリア", command=self.clear_logs).grid(row=0, column=1, sticky="e")
+        ttk.Label(log_header, text="\u30ed\u30b0\u8868\u793a").grid(row=0, column=0, sticky="w")
+        ttk.Button(log_header, text="\u30ed\u30b0\u30af\u30ea\u30a2", command=self.clear_logs).grid(row=0, column=1, sticky="e")
 
         self.logs = scrolledtext.ScrolledText(log_tab, wrap="word", height=12, state="disabled")
         self.logs.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
@@ -434,17 +438,17 @@ class MexcGuiApp:
         env = load_env()
         self.api_key_var.set(env.get("MEXC_API_KEY", ""))
         self.api_secret_var.set(env.get("MEXC_API_SECRET", ""))
-        self.log_queue.put("`.env` を再読込しました。")
+        self.log_queue.put(".env \u3092\u518d\u8aad\u8fbc\u3057\u307e\u3057\u305f")
 
     def save_env(self):
         save_env_value("MEXC_API_KEY", self.api_key_var.get().strip())
         save_env_value("MEXC_API_SECRET", self.api_secret_var.get().strip())
         load_env()
-        self.log_queue.put("`.env` を保存しました。")
+        self.log_queue.put(".env \u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f")
 
     def start_trading(self):
-        if self.trading_proc and self.trading_proc.poll() is None:
-            self.log_queue.put("運用はすでに実行中です。")
+        if self.trading_thread and self.trading_thread.is_alive():
+            self.log_queue.put("\u904b\u7528\u306f\u65e2\u306b\u5b9f\u884c\u4e2d\u3067\u3059")
             return
         symbols = []
         if self.trade_eth_var.get():
@@ -452,70 +456,59 @@ class MexcGuiApp:
         if self.trade_xrp_var.get():
             symbols.append("XRPUSDT")
         if not symbols:
-            self.log_queue.put("運用対象の通貨を選択してください。")
+            self.log_queue.put("\u904b\u7528\u5bfe\u8c61\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044")
             return
         for label, value in [
-            ("ETH 投資上限", self.trade_eth_budget_var.get().strip()),
-            ("XRP 投資上限", self.trade_xrp_budget_var.get().strip()),
-            ("ETH 1回の注文額", self.trade_eth_amount_var.get().strip()),
-            ("XRP 1回の注文額", self.trade_xrp_amount_var.get().strip()),
+            ("ETH \u6295\u8cc7\u4e0a\u9650", self.trade_eth_budget_var.get().strip()),
+            ("XRP \u6295\u8cc7\u4e0a\u9650", self.trade_xrp_budget_var.get().strip()),
+            ("ETH 1\u56de\u306e\u53d6\u5f15", self.trade_eth_amount_var.get().strip()),
+            ("XRP 1\u56de\u306e\u53d6\u5f15", self.trade_xrp_amount_var.get().strip()),
         ]:
             if value:
                 try:
                     Decimal(value)
                 except InvalidOperation:
-                    self.log_queue.put(f"{label}の入力が正しくありません。")
+                    self.log_queue.put(f"{label}\u304c\u6570\u5024\u3067\u306f\u3042\u308a\u307e\u305b\u3093")
                     return
-        env_copy = os.environ.copy()
-        env_copy["MEXC_API_KEY"] = self.api_key_var.get().strip()
-        env_copy["MEXC_API_SECRET"] = self.api_secret_var.get().strip()
-        env_copy["PYTHONUNBUFFERED"] = "1"
-        env_copy["MEXC_ALLOW_SYMBOLS"] = ",".join(symbols)
+
+        os.environ["MEXC_API_KEY"] = self.api_key_var.get().strip()
+        os.environ["MEXC_API_SECRET"] = self.api_secret_var.get().strip()
+        os.environ["PYTHONUNBUFFERED"] = "1"
+        os.environ["MEXC_ALLOW_SYMBOLS"] = ",".join(symbols)
 
         eth_budget = self.trade_eth_budget_var.get().strip()
         xrp_budget = self.trade_xrp_budget_var.get().strip()
         eth_trade = self.trade_eth_amount_var.get().strip()
         xrp_trade = self.trade_xrp_amount_var.get().strip()
         if eth_budget:
-            env_copy["MEXC_BUDGET_USDT_ETH"] = eth_budget
+            os.environ["MEXC_BUDGET_USDT_ETH"] = eth_budget
         if xrp_budget:
-            env_copy["MEXC_BUDGET_USDT_XRP"] = xrp_budget
+            os.environ["MEXC_BUDGET_USDT_XRP"] = xrp_budget
         if eth_trade:
-            env_copy["MEXC_TRADE_USDT_ETH"] = eth_trade
+            os.environ["MEXC_TRADE_USDT_ETH"] = eth_trade
         if xrp_trade:
-            env_copy["MEXC_TRADE_USDT_XRP"] = xrp_trade
-        cmd = [
-            sys.executable,
-            "-u",
-            "-m",
-            "mexc_bot",
-            "run",
-            "--config",
-            str(DEFAULT_CONFIG_PATH),
-        ]
-        self.trading_proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env_copy,
-            bufsize=1,
-        )
-        threading.Thread(
-            target=reader_thread,
-            args=(self.trading_proc, self.log_queue, "[運用] "),
+            os.environ["MEXC_TRADE_USDT_XRP"] = xrp_trade
+
+        self.trading_stop_event = threading.Event()
+        self._install_trading_log_handler()
+        self.trading_thread = threading.Thread(
+            target=self._run_trading_thread,
+            args=(self.trading_stop_event,),
             daemon=True,
-        ).start()
-        self.log_queue.put(f"運用を開始しました。対象={symbols}")
+        )
+        self.trading_thread.start()
+        self.log_queue.put(f"\u904b\u7528\u3092\u958b\u59cb\u3057\u307e\u3057\u305f\u3002\u5bfe\u8c61={symbols}")
         self._update_button_states()
 
     def stop_trading(self):
-        self.trading_proc = terminate_process(self.trading_proc, self.log_queue, "運用")
+        if self.trading_stop_event:
+            self.trading_stop_event.set()
+        self.log_queue.put("\u904b\u7528\u505c\u6b62\u3092\u8981\u6c42\u3057\u307e\u3057\u305f")
         self._update_button_states()
 
     def start_backtest(self):
         if self.backtest_thread and self.backtest_thread.is_alive():
-            self.log_queue.put("バックテストはすでに実行中です。")
+            self.log_queue.put("\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u306f\u65e2\u306b\u5b9f\u884c\u4e2d\u3067\u3059")
             return
         symbols = []
         if self.symbol_eth_var.get():
@@ -523,12 +516,12 @@ class MexcGuiApp:
         if self.symbol_xrp_var.get():
             symbols.append("XRPUSDT")
         if not symbols:
-            self.log_queue.put("バックテスト対象の通貨を選択してください。")
+            self.log_queue.put("\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u5bfe\u8c61\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044")
             return
         try:
             years = int(self.years_var.get().strip())
         except ValueError:
-            self.log_queue.put("期間(年)の入力が正しくありません。")
+            self.log_queue.put("\u671f\u9593(\u5e74)\u304c\u6570\u5024\u3067\u306f\u3042\u308a\u307e\u305b\u3093")
             return
 
         self.bt_graph.clear()
@@ -542,7 +535,7 @@ class MexcGuiApp:
             daemon=True,
         )
         self.backtest_thread.start()
-        self.log_queue.put(f"バックテストを開始しました。期間={years}年, 通貨={symbols}")
+        self.log_queue.put(f"\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u3092\u958b\u59cb\u3057\u307e\u3057\u305f\u3002\u671f\u9593={years}\u5e74, \u5bfe\u8c61={symbols}")
         self._update_button_states()
 
     def _run_backtest_thread(self, symbols, years, stop_event):
@@ -564,12 +557,12 @@ class MexcGuiApp:
                 stop_event=stop_event,
             )
         except Exception as exc:
-            self.log_queue.put(f"バックテストエラー: {exc}")
+            self.log_queue.put(f"\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u5931\u6557: {exc}")
             self.root.after(0, self._update_button_states)
             return
 
         if stop_event.is_set():
-            self.log_queue.put("バックテストを停止しました。")
+            self.log_queue.put("\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u3092\u505c\u6b62\u3057\u307e\u3057\u305f")
             self.root.after(0, self._update_button_states)
             return
 
@@ -579,23 +572,24 @@ class MexcGuiApp:
     def stop_backtest(self):
         if self.backtest_stop_event:
             self.backtest_stop_event.set()
-        self.log_queue.put("バックテスト停止を要求しました。")
+        self.log_queue.put("\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u505c\u6b62\u3092\u8981\u6c42\u3057\u307e\u3057\u305f")
         self._update_button_states()
 
     def _update_backtest_results(self, results):
-        lines = ["バックテスト結果"]
+        lines = ["\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u7d50\u679c"]
         for symbol, data in results.items():
-            lines.append(f"\n[{symbol}]")
-            lines.append(f"最終USDT: {data['final_usdt']}")
+            lines.append("")
+            lines.append(f"[{symbol}]")
+            lines.append(f"\u6700\u7d42USDT: {data['final_usdt']}")
             holdings = data.get("base_holdings", {})
             if isinstance(holdings, dict):
-                holdings_text = ", ".join([f"{k}: {v}" for k, v in holdings.items()]) or "なし"
+                holdings_text = ", ".join([f"{k}: {v}" for k, v in holdings.items()]) or "\u306a\u3057"
             else:
                 holdings_text = str(holdings)
-            lines.append(f"保有資産: {holdings_text}")
-            lines.append(f"評価額(USDT): {data['portfolio_value']}")
-            lines.append(f"利益率(%): {data['profit_pct']}")
-            lines.append(f"取引回数: {data['trades']}")
+            lines.append(f"\u4fdd\u6709\u6570\u91cf: {holdings_text}")
+            lines.append(f"\u8cc7\u7523\u5408\u8a08(USDT): {data['portfolio_value']}")
+            lines.append(f"\u5229\u76ca\u7387(%): {data['profit_pct']}")
+            lines.append(f"\u53d6\u5f15\u56de\u6570: {data['trades']}")
         self._set_results_text("\n".join(lines))
 
     def _set_results_text(self, text):
@@ -613,8 +607,10 @@ class MexcGuiApp:
         self.root.after(100, self._schedule_updates)
 
     def _refresh_process_state(self):
-        if self.trading_proc and self.trading_proc.poll() is not None:
-            self.trading_proc = None
+        if self.trading_thread and not self.trading_thread.is_alive():
+            self.trading_thread = None
+            self.trading_stop_event = None
+            self._remove_trading_log_handler()
 
     def _poll_logs(self):
         while True:
@@ -646,7 +642,7 @@ class MexcGuiApp:
 
     def _maybe_update_portfolio(self):
         now = time.time()
-        if not self.trading_proc or self.trading_proc.poll() is not None:
+        if not self.trading_thread or not self.trading_thread.is_alive():
             return
         if now - self.last_portfolio_fetch < 30:
             return
@@ -674,10 +670,10 @@ class MexcGuiApp:
 
             base_assets = [s.replace("USDT", "") for s in self.allow_symbols if s.endswith("USDT")]
             total_value = Decimal("0")
-            lines = ["運用結果 (最新)"]
+            lines = ["\u4fdd\u6709\u72b6\u6cc1 (\u904b\u7528)"]
             usdt = balances.get("USDT", Decimal("0"))
             total_value += usdt
-            lines.append(f"USDT 残高: {usdt}")
+            lines.append(f"USDT \u6b8b\u9ad8: {usdt}")
 
             cost_tracker = None
             cost_file = Path("cost_basis.json")
@@ -693,28 +689,28 @@ class MexcGuiApp:
                 price = Decimal(str(ticker.get("bidPrice", "0")))
                 value = qty * price
                 total_value += value
-                line = f"{base}: {qty} / 価格 {price} / 評価 {value}"
+                line = f"{base}: {qty} / \u4fa1\u683c {price} / \u8a55\u4fa1 {value}"
                 if cost_tracker:
                     avg_cost = cost_tracker.get_avg_cost(symbol)
                     if avg_cost and avg_cost > 0:
                         profit_pct = (price - avg_cost) / avg_cost * Decimal("100")
-                        line += f" / 損益 {profit_pct:.2f}%"
+                        line += f" / \u640d\u76ca {profit_pct:.2f}%"
                 lines.append(line)
 
-            lines.append(f"総評価額(USDT): {total_value}")
+            lines.append(f"\u8cc7\u7523\u5408\u8a08(USDT): {total_value}")
             self.live_x += 1
-            self.graph_queue.put(("live", "運用", self.live_x, float(total_value)))
+            self.graph_queue.put(("live", "\u6b8b\u9ad8", self.live_x, float(total_value)))
             self._set_results_text("\n".join(lines))
         except (InvalidOperation, KeyError, ValueError) as exc:
-            self.log_queue.put(f"評価取得エラー: {exc}")
+            self.log_queue.put(f"\u6b8b\u9ad8\u53d6\u5f97\u5931\u6557: {exc}")
         except Exception as exc:
-            self.log_queue.put(f"評価取得エラー: {exc}")
+            self.log_queue.put(f"\u6b8b\u9ad8\u53d6\u5f97\u5931\u6557: {exc}")
 
     def clear_logs(self):
         self.logs.configure(state="normal")
         self.logs.delete("1.0", "end")
         self.logs.configure(state="disabled")
-        self.log_queue.put("ログをクリアしました。")
+        self.log_queue.put("\u30ed\u30b0\u3092\u30af\u30ea\u30a2\u3057\u307e\u3057\u305f")
 
     def on_exit(self):
         self.stop_trading()
@@ -722,7 +718,7 @@ class MexcGuiApp:
         self.root.destroy()
 
     def _update_button_states(self):
-        trading_running = self.trading_proc is not None and self.trading_proc.poll() is None
+        trading_running = self.trading_thread is not None and self.trading_thread.is_alive()
         backtest_running = self.backtest_thread is not None and self.backtest_thread.is_alive()
 
         if trading_running:
@@ -767,8 +763,46 @@ class MexcGuiApp:
 
         notebook.bind("<Configure>", _resize_tabs)
 
+    def _run_trading_thread(self, stop_event):
+        try:
+            run_trading(config=str(DEFAULT_CONFIG_PATH), dry_run=False, stop_event=stop_event)
+        except Exception as exc:
+            self.log_queue.put(f"\u904b\u7528\u5931\u6557: {exc}")
+        finally:
+            self.log_queue.put("\u904b\u7528\u304c\u7d42\u4e86\u3057\u307e\u3057\u305f")
+
+    def _install_trading_log_handler(self):
+        if self.trading_log_handler is not None:
+            return
+        handler = _GuiLogHandler(self.log_queue)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logging.getLogger().addHandler(handler)
+        self.trading_log_handler = handler
+
+    def _remove_trading_log_handler(self):
+        if self.trading_log_handler is None:
+            return
+        logging.getLogger().removeHandler(self.trading_log_handler)
+        self.trading_log_handler = None
+
+
+class _GuiLogHandler(logging.Handler):
+    def __init__(self, log_queue):
+        super().__init__()
+        self.log_queue = log_queue
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.log_queue.put(translate_log_line(msg))
+        except Exception:
+            pass
+
 
 def main():
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     root = tk.Tk()
     app = MexcGuiApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_exit)
