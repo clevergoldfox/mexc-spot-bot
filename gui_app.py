@@ -1,628 +1,811 @@
-#!/usr/bin/env python3
-"""
-MEXC Trading Bot GUI Application
-Provides a user interface for settings, backtesting, and monitoring
-"""
-
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
-import threading
-import queue
+# -*- coding: utf-8 -*-
 import os
-from datetime import datetime, timedelta
-from decimal import Decimal
-from dotenv import load_dotenv, set_key, find_dotenv
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-from collections import deque
+import time
+import queue
+import threading
+import logging
+from pathlib import Path
+from decimal import Decimal, InvalidOperation
+import tkinter as tk
+from tkinter import ttk
+from tkinter import scrolledtext
+import tkinter.font as tkfont
+
+import yaml
+from dotenv import dotenv_values, load_dotenv
 
 from mexc_bot.mexc.client import MexcSpotClient
-from mexc_bot.backtest.data_provider import fetch_klines
-from mexc_bot.backtest.simulator import SpotWallet
-from mexc_bot.backtest.engine import BacktestEngine
-from mexc_bot.strategies.mq4_eth_xrp import EthMq4Strategy, EthMq4Params, XrpMq4Strategy, XrpMq4Params
-from mexc_bot.config import load_config
-from mexc_bot.logging_setup import setup_logging
-from mexc_bot.services.execution import ExecutionService, ExecutionConfig
-from mexc_bot.services.portfolio import Portfolio
-from mexc_bot.services.profit_sweep import ProfitSweeper, ProfitSweepConfig
+from mexc_bot.services.cost_basis import CostBasisTracker
+from mexc_bot.backtest.run_backtest import run as run_backtest
+from mexc_bot.cli import run as run_trading
 
 
-class TradingBotGUI:
+ENV_PATH = Path(".env")
+DEFAULT_CONFIG_PATH = Path("config.yaml")
+DEFAULT_SYMBOLS = ["ETHUSDT", "XRPUSDT"]
+
+
+def load_env():
+    if ENV_PATH.exists():
+        load_dotenv(ENV_PATH)
+        return dotenv_values(ENV_PATH)
+    return {}
+
+
+def save_env_value(key, value):
+    lines = []
+    found = False
+    if ENV_PATH.exists():
+        raw_lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
+        for line in raw_lines:
+            if line.strip().startswith(f"{key}="):
+                lines.append(f"{key}={value}")
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f"{key}={value}")
+    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def load_allow_symbols():
+    if not DEFAULT_CONFIG_PATH.exists():
+        return DEFAULT_SYMBOLS
+    try:
+        data = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return DEFAULT_SYMBOLS
+    symbols = data.get("safety", {}).get("allow_symbols")
+    if not symbols:
+        symbols = data.get("trading", {}).get("symbols")
+    if not symbols:
+        return DEFAULT_SYMBOLS
+    return symbols
+
+
+def translate_log_line(line):
+    replacements = {
+        "Bot started": "\u904b\u7528\u3092\u958b\u59cb\u3057\u307e\u3057\u305f",
+        "Stopping": "\u505c\u6b62\u4e2d",
+        "Signal": "\u30b7\u30b0\u30ca\u30eb",
+        "BUY": "\u8cb7\u3044",
+        "SELL": "\u58f2\u308a",
+        "price": "\u4fa1\u683c",
+        "reason": "\u7406\u7531",
+        "size": "\u6570\u91cf",
+        "Holdings": "\u4fdd\u6709",
+        "Profit": "\u5229\u76ca",
+        "Loop error": "\u30eb\u30fc\u30d7\u30a8\u30e9\u30fc",
+        "baseline set failed": "\u57fa\u6e96\u5024\u8a2d\u5b9a\u5931\u6557",
+        "profit sweep failed": "\u5229\u76ca\u78ba\u5b9a\u5931\u6557",
+        "Final USDT": "\u6700\u7d42USDT",
+        "Base holdings": "\u4fdd\u6709\u6570\u91cf",
+        "Portfolio value (USDT)": "\u8cc7\u7523\u5408\u8a08(USDT)",
+        "Profit %": "\u5229\u76ca\u7387",
+        "Trades": "\u53d6\u5f15\u56de\u6570",
+        "Fetched candles": "\u30ed\u30fc\u30bd\u30af\u53d6\u5f97",
+        "Using last": "\u6700\u65b0\u3092\u4f7f\u7528",
+        "Not enough data": "\u30c7\u30fc\u30bf\u4e0d\u8db3",
+        "Backtest started": "\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u958b\u59cb",
+        "Backtest already running": "\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u306f\u65e2\u306b\u5b9f\u884c\u4e2d",
+        "Trading already running": "\u904b\u7528\u306f\u65e2\u306b\u5b9f\u884c\u4e2d",
+        "Skip BUY": "\u8cb7\u3044\u3092\u30b9\u30ad\u30c3\u30d7",
+        "budget reached": "\u4e0a\u9650\u5230\u9054",
+    }
+    translated = line
+    for key, value in replacements.items():
+        translated = translated.replace(key, value)
+    return translated
+
+
+class PlotCanvas:
+    def __init__(self, canvas, label_y, label_x, font=None):
+        self.canvas = canvas
+        self.label_y = label_y
+        self.label_x = label_x
+        self.series = {}
+        self.padding = (65, 30, 20, 45)
+        self.font = font or ("Arial", 9)
+
+    def set_series(self, name, color):
+        if name not in self.series:
+            self.series[name] = {"points": [], "color": color}
+
+    def clear(self):
+        for series in self.series.values():
+            series["points"].clear()
+        self.redraw()
+
+    def add_point(self, name, x, y):
+        if name not in self.series:
+            return
+        self.series[name]["points"].append((x, y))
+        if len(self.series[name]["points"]) > 2000:
+            self.series[name]["points"] = self.series[name]["points"][-2000:]
+
+    def redraw(self):
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width <= 10 or height <= 10:
+            return
+
+        self.canvas.delete("all")
+        self.canvas.configure(background="#ffffff")
+
+        left, top, right, bottom = self.padding
+        plot_w = max(1, width - left - right)
+        plot_h = max(1, height - top - bottom)
+
+        all_points = [pt for s in self.series.values() for pt in s["points"]]
+        if all_points:
+            xs = [pt[0] for pt in all_points]
+            ys = [pt[1] for pt in all_points]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+        else:
+            x_min, x_max = 0, 1
+            y_min, y_max = 0, 1
+
+        if x_min == x_max:
+            x_max = x_min + 1
+        if y_min == y_max:
+            y_max = y_min + 1
+
+        y_pad = (y_max - y_min) * 0.05
+        y_min -= y_pad
+        y_max += y_pad
+
+        grid_color = "#d9d9d9"
+        axis_color = "#000000"
+        font = self.font
+
+        for i in range(11):
+            x = left + (plot_w / 10) * i
+            self.canvas.create_line(x, top, x, top + plot_h, fill=grid_color)
+            label_val = x_min + (x_max - x_min) * (i / 10)
+            self.canvas.create_text(x, top + plot_h + 15, text=f"{label_val:.0f}", font=font)
+
+        for i in range(11):
+            y = top + (plot_h / 10) * i
+            self.canvas.create_line(left, y, left + plot_w, y, fill=grid_color)
+            label_val = y_max - (y_max - y_min) * (i / 10)
+            self.canvas.create_text(left - 10, y, text=f"{label_val:.0f}", font=font, anchor="e")
+
+        self.canvas.create_rectangle(left, top, left + plot_w, top + plot_h, outline=axis_color)
+        self.canvas.create_text(left + 4, top + 4, text=self.label_y, font=font, anchor="nw")
+        self.canvas.create_text(left + plot_w - 4, top + plot_h - 4, text=self.label_x, font=font, anchor="se")
+
+        for series in self.series.values():
+            points = series["points"]
+            if len(points) < 2:
+                continue
+            mapped = []
+            for x_val, y_val in points:
+                x = left + (x_val - x_min) / (x_max - x_min) * plot_w
+                y = top + (y_max - y_val) / (y_max - y_min) * plot_h
+                mapped.append((x, y))
+            for i in range(1, len(mapped)):
+                self.canvas.create_line(
+                    mapped[i - 1][0],
+                    mapped[i - 1][1],
+                    mapped[i][0],
+                    mapped[i][1],
+                    fill=series["color"],
+                    width=2,
+                )
+
+
+class MexcGuiApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("MEXC Trading Bot - Control Panel")
-        self.root.geometry("1200x800")
-        self.root.minsize(800, 600)  # Minimum window size
-        
-        # State variables
-        self.trading_active = False
-        self.backtest_active = False
-        self.trading_thread = None
-        self.backtest_thread = None
+        self.root.title("MEXC \u30b9\u30dd\u30c3\u30c8\u30dc\u30c3\u30c8 UI")
+        self.root.geometry("1100x780")
+
+        self._style = ttk.Style()
+        self._tab_style_counter = 0
+        self._apply_japanese_font()
+        self._tab_font = tkfont.nametofont("TkDefaultFont")
+
         self.log_queue = queue.Queue()
-        
-        # Data for graphs
-        self.operating_data = {
-            'time': deque(maxlen=100),
-            'portfolio_value': deque(maxlen=100),
-            'eth_holdings': deque(maxlen=100),
-            'xrp_holdings': deque(maxlen=100),
-        }
-        self.backtest_data = {
-            'time': deque(maxlen=100),
-            'portfolio_value': deque(maxlen=100),
-            'profit_pct': deque(maxlen=100),
-        }
-        self.current_graph_mode = 'operating'  # 'operating' or 'backtest'
-        
-        # Load .env file
-        self.env_path = find_dotenv() or '.env'
-        if not os.path.exists(self.env_path):
-            # Create .env file if it doesn't exist
-            with open(self.env_path, 'w') as f:
-                f.write("MEXC_API_KEY=\nMEXC_API_SECRET=\n")
-        load_dotenv(self.env_path)
-        
-        self.setup_ui()
-        self.check_log_queue()
-        
-    def setup_ui(self):
-        """Setup the user interface"""
-        # Create notebook for tabs
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Settings Tab
-        self.settings_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.settings_frame, text="Settings")
-        self.setup_settings_tab()
-        
-        # Results Tab
-        self.results_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.results_frame, text="Results")
-        self.setup_results_tab()
-        
-        # Footer buttons (always visible)
-        self.setup_footer()
-        
-    def setup_settings_tab(self):
-        """Setup the Settings tab"""
-        # API Configuration Section
-        api_frame = ttk.LabelFrame(self.settings_frame, text="API Configuration", padding=10)
-        api_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(api_frame, text="MEXC API Key:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.api_key_var = tk.StringVar(value=os.getenv("MEXC_API_KEY", ""))
-        ttk.Entry(api_frame, textvariable=self.api_key_var, width=50).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(api_frame, text="Save", command=self.save_api_key).grid(row=0, column=2, padx=5)
-        
-        ttk.Label(api_frame, text="MEXC API Secret:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.api_secret_var = tk.StringVar(value=os.getenv("MEXC_API_SECRET", ""))
-        ttk.Entry(api_frame, textvariable=self.api_secret_var, width=50, show="*").grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(api_frame, text="Save", command=self.save_api_secret).grid(row=1, column=2, padx=5)
-        
-        # Backtest Configuration Section
-        backtest_frame = ttk.LabelFrame(self.settings_frame, text="Backtest Configuration", padding=10)
-        backtest_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(backtest_frame, text="Backtest Period:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.period_var = tk.StringVar(value="1")
-        period_combo = ttk.Combobox(backtest_frame, textvariable=self.period_var, 
-                                     values=["1", "3", "6", "12"], width=10, state="readonly")
-        period_combo.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
-        ttk.Label(backtest_frame, text="year(s)").grid(row=0, column=2, sticky=tk.W, padx=5)
-        
-        # Symbol Selection
-        ttk.Label(backtest_frame, text="Select Symbols:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        symbol_frame = ttk.Frame(backtest_frame)
-        symbol_frame.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=5)
-        
-        self.eth_checkbox_var = tk.BooleanVar(value=True)
-        self.xrp_checkbox_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(symbol_frame, text="ETHUSDT", variable=self.eth_checkbox_var).pack(side=tk.LEFT, padx=10)
-        ttk.Checkbutton(symbol_frame, text="XRPUSDT", variable=self.xrp_checkbox_var).pack(side=tk.LEFT, padx=10)
-        
-        # Strategy Parameters Section
-        strategy_frame = ttk.LabelFrame(self.settings_frame, text="Strategy Parameters (ETH)", padding=10)
-        strategy_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        params_grid = ttk.Frame(strategy_frame)
-        params_grid.pack(fill=tk.X)
-        
-        # RSI Parameters
-        ttk.Label(params_grid, text="RSI Buy Level:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.rsi_buy_var = tk.DoubleVar(value=40.0)
-        ttk.Spinbox(params_grid, from_=30.0, to=50.0, textvariable=self.rsi_buy_var, width=10).grid(row=0, column=1, padx=5, pady=2)
-        
-        ttk.Label(params_grid, text="RSI Sell Level:").grid(row=0, column=2, sticky=tk.W, padx=10, pady=2)
-        self.rsi_sell_var = tk.DoubleVar(value=60.0)
-        ttk.Spinbox(params_grid, from_=50.0, to=70.0, textvariable=self.rsi_sell_var, width=10).grid(row=0, column=3, padx=5, pady=2)
-        
-        ttk.Label(params_grid, text="Pullback ATR Mult:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.pullback_atr_var = tk.DoubleVar(value=0.65)
-        ttk.Spinbox(params_grid, from_=0.5, to=1.0, increment=0.05, textvariable=self.pullback_atr_var, width=10).grid(row=1, column=1, padx=5, pady=2)
-        
-        ttk.Label(params_grid, text="Min Trend Strength:").grid(row=1, column=2, sticky=tk.W, padx=10, pady=2)
-        self.trend_strength_var = tk.DoubleVar(value=0.001)
-        ttk.Spinbox(params_grid, from_=0.0001, to=0.01, increment=0.0001, textvariable=self.trend_strength_var, width=10).grid(row=1, column=3, padx=5, pady=2)
-        
-    def setup_results_tab(self):
-        """Setup the Results tab"""
-        # Graph Section (Upper Half)
-        graph_container = ttk.Frame(self.results_frame)
-        graph_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Graph mode switcher
-        mode_frame = ttk.Frame(graph_container)
-        mode_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(mode_frame, text="Graph Mode:").pack(side=tk.LEFT, padx=5)
-        self.graph_mode_var = tk.StringVar(value="operating")
-        ttk.Radiobutton(mode_frame, text="Operating", variable=self.graph_mode_var, 
-                       value="operating", command=self.switch_graph_mode).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(mode_frame, text="Backtest", variable=self.graph_mode_var, 
-                       value="backtest", command=self.switch_graph_mode).pack(side=tk.LEFT, padx=5)
-        
-        # Matplotlib figure
-        self.fig = Figure(figsize=(10, 4), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.fig, graph_container)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.update_graph()
-        
-        # Logs Section (Lower Half)
-        logs_frame = ttk.LabelFrame(self.results_frame, text="Logs", padding=5)
-        logs_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        self.log_text = scrolledtext.ScrolledText(logs_frame, height=15, wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        self.log_text.config(state=tk.DISABLED)
-        
-    def setup_footer(self):
-        """Setup footer buttons"""
-        # Create a container frame for the footer to ensure it's always visible
-        footer_container = ttk.Frame(self.root)
-        footer_container.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
-        
-        # Add a separator line above buttons for visibility
-        ttk.Separator(footer_container, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 5))
-        
-        footer = ttk.Frame(footer_container)
-        footer.pack(fill=tk.X)
-        
-        # Trading buttons
-        trading_frame = ttk.Frame(footer)
-        trading_frame.pack(side=tk.LEFT, padx=10)
-        ttk.Label(trading_frame, text="Trading:", font=('Arial', 10, 'bold')).pack(side=tk.LEFT, padx=5)
-        self.start_trading_btn = ttk.Button(trading_frame, text="▶ Start Trading", command=self.start_trading, width=15)
-        self.start_trading_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.stop_trading_btn = ttk.Button(trading_frame, text="⏹ Stop Trading", command=self.stop_trading, state=tk.DISABLED, width=15)
-        self.stop_trading_btn.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Separator(footer, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=20)
-        
-        # Backtest buttons
-        backtest_frame = ttk.Frame(footer)
-        backtest_frame.pack(side=tk.LEFT, padx=10)
-        ttk.Label(backtest_frame, text="Backtest:", font=('Arial', 10, 'bold')).pack(side=tk.LEFT, padx=5)
-        self.start_backtest_btn = ttk.Button(backtest_frame, text="▶ Start Backtest", command=self.start_backtest, width=15)
-        self.start_backtest_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.stop_backtest_btn = ttk.Button(backtest_frame, text="⏹ Stop Backtest", command=self.stop_backtest, state=tk.DISABLED, width=15)
-        self.stop_backtest_btn.pack(side=tk.LEFT, padx=5)
-        
-    def save_api_key(self):
-        """Save API key to .env file"""
-        api_key = self.api_key_var.get().strip()
-        if api_key:
-            set_key(self.env_path, "MEXC_API_KEY", api_key)
-            self.log_message("API Key saved successfully")
-            messagebox.showinfo("Success", "API Key saved to .env file")
-        else:
-            messagebox.showerror("Error", "API Key cannot be empty")
-    
-    def save_api_secret(self):
-        """Save API secret to .env file"""
-        api_secret = self.api_secret_var.get().strip()
-        if api_secret:
-            set_key(self.env_path, "MEXC_API_SECRET", api_secret)
-            self.log_message("API Secret saved successfully")
-            messagebox.showinfo("Success", "API Secret saved to .env file")
-        else:
-            messagebox.showerror("Error", "API Secret cannot be empty")
-    
-    def switch_graph_mode(self):
-        """Switch between operating and backtest graph modes"""
-        self.current_graph_mode = self.graph_mode_var.get()
-        self.update_graph()
-    
-    def update_graph(self):
-        """Update the graph display"""
-        self.ax.clear()
-        
-        if self.current_graph_mode == 'operating':
-            if len(self.operating_data['time']) > 0:
-                times = list(self.operating_data['time'])
-                values = list(self.operating_data['portfolio_value'])
-                
-                # Convert datetime objects to numbers for plotting
-                if times and isinstance(times[0], datetime):
-                    time_nums = [(t - times[0]).total_seconds() / 60 for t in times]  # Minutes since start
-                    self.ax.plot(time_nums, values, label='Portfolio Value', linewidth=2, color='blue')
-                    self.ax.set_xlabel('Time (minutes)')
-                else:
-                    self.ax.plot(times, values, label='Portfolio Value', linewidth=2, color='blue')
-                    self.ax.set_xlabel('Time')
-                
-                self.ax.set_title('Real-Time Trading Status', fontsize=12, fontweight='bold')
-                self.ax.set_ylabel('Portfolio Value (USDT)')
-                self.ax.legend()
-                self.ax.grid(True, alpha=0.3)
-        else:  # backtest mode
-            if len(self.backtest_data['time']) > 0:
-                times = list(self.backtest_data['time'])
-                profit_pct = list(self.backtest_data['profit_pct'])
-                
-                self.ax.plot(times, profit_pct, label='Profit %', linewidth=2, color='green')
-                self.ax.set_title('Backtest Results', fontsize=12, fontweight='bold')
-                self.ax.set_xlabel('Candle Index')
-                self.ax.set_ylabel('Profit %')
-                self.ax.legend()
-                self.ax.grid(True, alpha=0.3)
-                self.ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
-        
-        self.fig.tight_layout()
-        self.canvas.draw()
-    
-    def log_message(self, message):
-        """Add message to log queue"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log_queue.put(f"[{timestamp}] {message}")
-    
-    def check_log_queue(self):
-        """Check for new log messages and display them"""
-        try:
-            while True:
-                message = self.log_queue.get_nowait()
-                self.log_text.config(state=tk.NORMAL)
-                self.log_text.insert(tk.END, message + "\n")
-                self.log_text.see(tk.END)
-                self.log_text.config(state=tk.DISABLED)
-        except queue.Empty:
-            pass
-        
-        # Schedule next check
-        self.root.after(100, self.check_log_queue)
-    
+        self.graph_queue = queue.Queue()
+        self.trading_thread = None
+        self.trading_stop_event = None
+        self.trading_log_handler = None
+        self.backtest_thread = None
+        self.backtest_stop_event = None
+        self.last_portfolio_fetch = 0.0
+        self.allow_symbols = load_allow_symbols()
+        self.bt_series_colors = {"ETHUSDT": "#1f77b4", "XRPUSDT": "#2ca02c"}
+        self.live_x = 0
+
+        env = load_env()
+        self.api_key_var = tk.StringVar(value=env.get("MEXC_API_KEY", ""))
+        self.api_secret_var = tk.StringVar(value=env.get("MEXC_API_SECRET", ""))
+        self.years_var = tk.StringVar(value="3")
+        self.symbol_eth_var = tk.BooleanVar(value=True)
+        self.symbol_xrp_var = tk.BooleanVar(value=True)
+        self.trade_eth_var = tk.BooleanVar(value=True)
+        self.trade_xrp_var = tk.BooleanVar(value=True)
+        self.trade_eth_budget_var = tk.StringVar(value="1000")
+        self.trade_xrp_budget_var = tk.StringVar(value="1000")
+        self.trade_eth_amount_var = tk.StringVar(value="50")
+        self.trade_xrp_amount_var = tk.StringVar(value="40")
+
+        self._build_ui()
+        self._schedule_updates()
+
+    def _apply_japanese_font(self):
+        preferred_fonts = ["Yu Gothic UI", "Meiryo UI", "Meiryo", "MS Gothic"]
+        available = set(tkfont.families(self.root))
+        chosen = None
+        for name in preferred_fonts:
+            if name in available:
+                chosen = name
+                break
+        if chosen is None:
+            return
+        default_font = tkfont.nametofont("TkDefaultFont")
+        default_font.configure(family=chosen, size=9)
+        for font_name in (
+            "TkTextFont",
+            "TkFixedFont",
+            "TkMenuFont",
+            "TkHeadingFont",
+            "TkCaptionFont",
+            "TkTooltipFont",
+        ):
+            try:
+                tkfont.nametofont(font_name).configure(family=chosen, size=9)
+            except tk.TclError:
+                pass
+
+    def _build_ui(self):
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        main = ttk.Frame(self.root, padding=10)
+        main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(0, weight=1)
+        main.rowconfigure(1, weight=0)
+
+        notebook = ttk.Notebook(main)
+        notebook.grid(row=0, column=0, sticky="nsew")
+        self._register_notebook(notebook)
+
+        settings_tab = ttk.Frame(notebook)
+        results_tab = ttk.Frame(notebook)
+        notebook.add(settings_tab, text="\u8a2d\u5b9a")
+        notebook.add(results_tab, text="\u7d50\u679c")
+
+        self._build_settings_tab(settings_tab)
+        self._build_results_tab(results_tab)
+
+        footer = ttk.Frame(main)
+        footer.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(4, weight=1)
+
+        self.btn_start_trading = ttk.Button(footer, text="\u904b\u7528\u958b\u59cb", command=self.start_trading)
+        self.btn_start_trading.grid(row=0, column=0, padx=(0, 8))
+        self.btn_stop_trading = ttk.Button(footer, text="\u904b\u7528\u505c\u6b62", command=self.stop_trading)
+        self.btn_stop_trading.grid(row=0, column=1, padx=(0, 8))
+        self.btn_start_backtest = ttk.Button(footer, text="\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u958b\u59cb", command=self.start_backtest)
+        self.btn_start_backtest.grid(row=0, column=2, padx=(0, 8))
+        self.btn_stop_backtest = ttk.Button(footer, text="\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u505c\u6b62", command=self.stop_backtest)
+        self.btn_stop_backtest.grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(footer, text="\u7d42\u4e86", command=self.on_exit).grid(row=0, column=5, sticky="e")
+
+        self._update_button_states()
+
+    def _build_settings_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+
+        api_frame = ttk.LabelFrame(parent, text="API \u8a2d\u5b9a", padding=10)
+        api_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        api_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(api_frame, text="API\u30ad\u30fc (MEXC_API_KEY)").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(api_frame, textvariable=self.api_key_var).grid(row=0, column=1, sticky="ew")
+
+        ttk.Label(api_frame, text="API\u30b7\u30fc\u30af\u30ec\u30c3\u30c8 (MEXC_API_SECRET)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Entry(api_frame, textvariable=self.api_secret_var, show="*").grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+        btn_frame = ttk.Frame(api_frame)
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(btn_frame, text=".env \u518d\u8aad\u8fbc", command=self.reload_env).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(btn_frame, text=".env \u4fdd\u5b58", command=self.save_env).grid(row=0, column=1)
+
+        backtest_frame = ttk.LabelFrame(parent, text="\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u8a2d\u5b9a", padding=10)
+        backtest_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+        backtest_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(backtest_frame, text="\u671f\u9593(\u5e74)").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(backtest_frame, textvariable=self.years_var, width=8).grid(row=0, column=1, sticky="w")
+
+        symbols_frame = ttk.Frame(backtest_frame)
+        symbols_frame.grid(row=0, column=2, sticky="w", padx=(20, 0))
+        ttk.Label(symbols_frame, text="\u5bfe\u8c61\u901a\u8ca8").grid(row=0, column=0, padx=(0, 8))
+        ttk.Checkbutton(symbols_frame, text="ETH", variable=self.symbol_eth_var).grid(row=0, column=1, padx=(0, 8))
+        ttk.Checkbutton(symbols_frame, text="XRP", variable=self.symbol_xrp_var).grid(row=0, column=2)
+
+        trading_frame = ttk.LabelFrame(parent, text="\u904b\u7528\u8a2d\u5b9a", padding=10)
+        trading_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+        trading_frame.columnconfigure(1, weight=1)
+        trading_frame.columnconfigure(2, weight=1)
+        trading_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(trading_frame, text="\u5bfe\u8c61").grid(row=0, column=0, sticky="w")
+        ttk.Label(trading_frame, text="\u6295\u8cc7\u4e0a\u9650(USDT)").grid(row=0, column=1, sticky="w")
+        ttk.Label(trading_frame, text="1\u56de\u306e\u53d6\u5f15(USDT)").grid(row=0, column=2, sticky="w")
+
+        eth_row = ttk.Frame(trading_frame)
+        eth_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        eth_row.columnconfigure(1, weight=1)
+        eth_row.columnconfigure(2, weight=1)
+
+        ttk.Checkbutton(eth_row, text="ETH \u3092\u904b\u7528", variable=self.trade_eth_var).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Entry(eth_row, textvariable=self.trade_eth_budget_var, width=10).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ttk.Entry(eth_row, textvariable=self.trade_eth_amount_var, width=10).grid(row=0, column=2, sticky="w")
+
+        xrp_row = ttk.Frame(trading_frame)
+        xrp_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        xrp_row.columnconfigure(1, weight=1)
+        xrp_row.columnconfigure(2, weight=1)
+
+        ttk.Checkbutton(xrp_row, text="XRP \u3092\u904b\u7528", variable=self.trade_xrp_var).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Entry(xrp_row, textvariable=self.trade_xrp_budget_var, width=10).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ttk.Entry(xrp_row, textvariable=self.trade_xrp_amount_var, width=10).grid(row=0, column=2, sticky="w")
+
+        config_frame = ttk.Frame(parent, padding=(5, 0))
+        config_frame.grid(row=3, column=0, sticky="ew")
+        ttk.Label(config_frame, text="\u53d6\u5f15\u8a2d\u5b9a\u30d5\u30a1\u30a4\u30eb").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(config_frame, text=str(DEFAULT_CONFIG_PATH)).grid(row=0, column=1, sticky="w")
+
+    def _build_results_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        graph_container = ttk.Frame(parent)
+        graph_container.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        graph_container.columnconfigure(0, weight=1)
+        graph_container.rowconfigure(0, weight=1)
+
+        graph_tabs = ttk.Notebook(graph_container)
+        graph_tabs.grid(row=0, column=0, sticky="nsew")
+        graph_tabs.enable_traversal()
+        graph_tabs.configure(takefocus=1)
+        self._register_notebook(graph_tabs)
+
+        op_tab = ttk.Frame(graph_tabs)
+        bt_tab = ttk.Frame(graph_tabs)
+        graph_tabs.add(op_tab, text="\u904b\u7528\u30b0\u30e9\u30d5")
+        graph_tabs.add(bt_tab, text="\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u30b0\u30e9\u30d5")
+
+        op_tab.rowconfigure(0, weight=1)
+        op_tab.columnconfigure(0, weight=1)
+        bt_tab.rowconfigure(0, weight=1)
+        bt_tab.columnconfigure(0, weight=1)
+
+        self.op_canvas = tk.Canvas(op_tab, background="#ffffff", highlightthickness=0)
+        self.op_canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.bt_canvas = tk.Canvas(bt_tab, background="#ffffff", highlightthickness=0)
+        self.bt_canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.op_graph = PlotCanvas(self.op_canvas, "\u6b8b\u9ad8(USDT)", "\u6642\u9593", font=self._tab_font)
+        self.op_graph.set_series("\u6b8b\u9ad8", "#1f77b4")
+        self.bt_graph = PlotCanvas(self.bt_canvas, "\u6b8b\u9ad8(USDT)", "\u6642\u9593", font=self._tab_font)
+        for symbol in DEFAULT_SYMBOLS:
+            self.bt_graph.set_series(symbol, self.bt_series_colors.get(symbol, "#2ca02c"))
+
+        self.op_canvas.bind("<Configure>", lambda _event: self.op_graph.redraw())
+        self.bt_canvas.bind("<Configure>", lambda _event: self.bt_graph.redraw())
+
+        lower_container = ttk.Frame(parent)
+        lower_container.grid(row=1, column=0, sticky="nsew")
+        lower_container.columnconfigure(0, weight=1)
+        lower_container.rowconfigure(0, weight=1)
+
+        log_tabs = ttk.Notebook(lower_container)
+        log_tabs.grid(row=0, column=0, sticky="nsew")
+        self._register_notebook(log_tabs)
+
+        log_tab = ttk.Frame(log_tabs)
+        result_tab = ttk.Frame(log_tabs)
+        log_tabs.add(log_tab, text="\u30ed\u30b0")
+        log_tabs.add(result_tab, text="\u7d50\u679c")
+
+        log_tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(1, weight=1)
+
+        log_header = ttk.Frame(log_tab)
+        log_header.grid(row=0, column=0, sticky="ew")
+        log_header.columnconfigure(0, weight=1)
+        ttk.Label(log_header, text="\u30ed\u30b0\u8868\u793a").grid(row=0, column=0, sticky="w")
+        ttk.Button(log_header, text="\u30ed\u30b0\u30af\u30ea\u30a2", command=self.clear_logs).grid(row=0, column=1, sticky="e")
+
+        self.logs = scrolledtext.ScrolledText(log_tab, wrap="word", height=12, state="disabled")
+        self.logs.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        result_tab.columnconfigure(0, weight=1)
+        result_tab.rowconfigure(0, weight=1)
+
+        self.results_text = scrolledtext.ScrolledText(result_tab, wrap="word", height=12, state="disabled")
+        self.results_text.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+    def reload_env(self):
+        env = load_env()
+        self.api_key_var.set(env.get("MEXC_API_KEY", ""))
+        self.api_secret_var.set(env.get("MEXC_API_SECRET", ""))
+        self.log_queue.put(".env \u3092\u518d\u8aad\u8fbc\u3057\u307e\u3057\u305f")
+
+    def save_env(self):
+        save_env_value("MEXC_API_KEY", self.api_key_var.get().strip())
+        save_env_value("MEXC_API_SECRET", self.api_secret_var.get().strip())
+        load_env()
+        self.log_queue.put(".env \u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f")
+
     def start_trading(self):
-        """Start live trading"""
-        if self.trading_active:
-            messagebox.showwarning("Warning", "Trading is already active")
+        if self.trading_thread and self.trading_thread.is_alive():
+            self.log_queue.put("\u904b\u7528\u306f\u65e2\u306b\u5b9f\u884c\u4e2d\u3067\u3059")
             return
-        
-        # Validate API credentials
-        api_key = os.getenv("MEXC_API_KEY")
-        api_secret = os.getenv("MEXC_API_SECRET")
-        
-        if not api_key or not api_secret:
-            messagebox.showerror("Error", "Please set API Key and Secret in Settings tab")
-            return
-        
-        self.trading_active = True
-        self.start_trading_btn.config(state=tk.DISABLED)
-        self.stop_trading_btn.config(state=tk.NORMAL)
-        
-        self.log_message("Starting live trading...")
-        self.trading_thread = threading.Thread(target=self.run_trading, daemon=True)
-        self.trading_thread.start()
-    
-    def stop_trading(self):
-        """Stop live trading"""
-        if not self.trading_active:
-            return
-        
-        self.trading_active = False
-        self.start_trading_btn.config(state=tk.NORMAL)
-        self.stop_trading_btn.config(state=tk.DISABLED)
-        self.log_message("Stopping live trading...")
-    
-    def run_trading(self):
-        """Run live trading in background thread"""
-        try:
-            # Load config
-            config_path = "configs/eth_optimized.yaml"
-            if not os.path.exists(config_path):
-                config_path = "config.yaml"
-            
-            cfg = load_config(config_path)
-            setup_logging(cfg.runtime.log_level)
-            
-            # Initialize client
-            api_key = os.getenv("MEXC_API_KEY")
-            api_secret = os.getenv("MEXC_API_SECRET")
-            base_url = os.getenv("MEXC_BASE_URL") or "https://api.mexc.com"
-            recv_window = int(os.getenv("MEXC_RECV_WINDOW") or "5000")
-            
-            client = MexcSpotClient(api_key, api_secret, base_url=base_url, recv_window=recv_window)
-            
-            # Initialize services
-            execsvc = ExecutionService(client, ExecutionConfig(**cfg.execution.model_dump()), dry_run=False)
-            
-            # Initialize strategy based on config
-            strategy_name = cfg.strategy.name.lower()
-            quote_per_trade = Decimal(str(cfg.safety.max_usdt_per_order))
-            
-            if strategy_name == "eth_mq4_h1" or strategy_name == "mq4_eth":
-                from mexc_bot.strategies.mq4_eth_xrp import EthMq4Strategy, EthMq4Params
-                params = EthMq4Params(**cfg.strategy.params)
-                strat = EthMq4Strategy(client, params, quote_per_trade=quote_per_trade)
-            elif strategy_name == "xrp_mq4_h4" or strategy_name == "mq4_xrp":
-                from mexc_bot.strategies.mq4_eth_xrp import XrpMq4Strategy, XrpMq4Params
-                params = XrpMq4Params(**cfg.strategy.params)
-                strat = XrpMq4Strategy(client, params, quote_per_trade=quote_per_trade)
-            elif strategy_name == "h1_trend_pullback" or strategy_name == "trend_pullback":
-                from mexc_bot.strategies.h1_trend_pullback import H1TrendPullbackStrategy, H1TrendPullbackParams
-                params = H1TrendPullbackParams(**cfg.strategy.params)
-                strat = H1TrendPullbackStrategy(client, params, quote_per_trade=quote_per_trade)
-            else:
-                raise ValueError(f"Unknown strategy: {strategy_name}")
-            
-            self.log_message("Trading bot initialized successfully")
-            
-            # Trading loop
-            import time
-            last_trade_ts = {s: 0.0 for s in cfg.safety.allow_symbols}
-            
-            while self.trading_active:
-                try:
-                    for symbol in cfg.safety.allow_symbols:
-                        if not self.trading_active:
-                            break
-                        
-                        if time.time() - last_trade_ts.get(symbol, 0.0) < cfg.safety.cooldown_seconds:
-                            continue
-                        
-                        sig = strat.generate(symbol)
-                        if sig:
-                            self.log_message(f"Signal: {sig.side} {sig.symbol} | {sig.reason}")
-                            
-                            if sig.side == "BUY":
-                                execsvc.market_buy_quote(symbol, Decimal(str(sig.size_quote)))
-                                last_trade_ts[symbol] = time.time()
-                                self.log_message(f"Executed BUY order for {symbol}")
-                    
-                    time.sleep(cfg.runtime.poll_seconds)
-                    
-                    # Update operating graph periodically (every 10 iterations)
-                    if hasattr(self, '_trading_iteration_count'):
-                        self._trading_iteration_count += 1
-                    else:
-                        self._trading_iteration_count = 0
-                    
-                    if self._trading_iteration_count % 10 == 0:
-                        try:
-                            from mexc_bot.cli import load_portfolio
-                            portfolio = load_portfolio(client)
-                            base_assets = cfg.portfolio.base_assets
-                            portfolio_value = portfolio.asset_free("USDT")
-                            
-                            # Get current prices and calculate total value
-                            for asset in base_assets:
-                                symbol = f"{asset}USDT"
-                                try:
-                                    ticker = client.book_ticker(symbol)
-                                    if isinstance(ticker, dict) and "bidPrice" in ticker:
-                                        price = Decimal(str(ticker["bidPrice"]))
-                                        qty = portfolio.asset_free(asset)
-                                        portfolio_value += qty * price
-                                except:
-                                    pass
-                            
-                            current_time = datetime.now()
-                            self.operating_data['time'].append(current_time)
-                            self.operating_data['portfolio_value'].append(float(portfolio_value))
-                            
-                            if self.current_graph_mode == 'operating':
-                                self.root.after(0, self.update_graph)
-                        except:
-                            pass  # Don't fail trading if graph update fails
-                    
-                except Exception as e:
-                    self.log_message(f"Trading error: {str(e)}")
-                    time.sleep(5)
-            
-            self.log_message("Trading stopped")
-            
-        except Exception as e:
-            self.log_message(f"Failed to start trading: {str(e)}")
-            self.trading_active = False
-            self.root.after(0, lambda: self.start_trading_btn.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.stop_trading_btn.config(state=tk.DISABLED))
-    
-    def start_backtest(self):
-        """Start backtest"""
-        if self.backtest_active:
-            messagebox.showwarning("Warning", "Backtest is already running")
-            return
-        
-        # Get selected symbols
         symbols = []
-        if self.eth_checkbox_var.get():
+        if self.trade_eth_var.get():
             symbols.append("ETHUSDT")
-        if self.xrp_checkbox_var.get():
+        if self.trade_xrp_var.get():
             symbols.append("XRPUSDT")
-        
         if not symbols:
-            messagebox.showerror("Error", "Please select at least one symbol")
+            self.log_queue.put("\u904b\u7528\u5bfe\u8c61\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044")
             return
-        
-        self.backtest_active = True
-        self.start_backtest_btn.config(state=tk.DISABLED)
-        self.stop_backtest_btn.config(state=tk.NORMAL)
-        
-        # Clear backtest data
-        self.backtest_data = {
-            'time': deque(maxlen=100),
-            'portfolio_value': deque(maxlen=100),
-            'profit_pct': deque(maxlen=100),
-        }
-        
-        self.log_message(f"Starting backtest for {', '.join(symbols)}...")
-        self.backtest_thread = threading.Thread(target=self.run_backtest, args=(symbols,), daemon=True)
-        self.backtest_thread.start()
-    
-    def stop_backtest(self):
-        """Stop backtest"""
-        if not self.backtest_active:
+        for label, value in [
+            ("ETH \u6295\u8cc7\u4e0a\u9650", self.trade_eth_budget_var.get().strip()),
+            ("XRP \u6295\u8cc7\u4e0a\u9650", self.trade_xrp_budget_var.get().strip()),
+            ("ETH 1\u56de\u306e\u53d6\u5f15", self.trade_eth_amount_var.get().strip()),
+            ("XRP 1\u56de\u306e\u53d6\u5f15", self.trade_xrp_amount_var.get().strip()),
+        ]:
+            if value:
+                try:
+                    Decimal(value)
+                except InvalidOperation:
+                    self.log_queue.put(f"{label}\u304c\u6570\u5024\u3067\u306f\u3042\u308a\u307e\u305b\u3093")
+                    return
+
+        os.environ["MEXC_API_KEY"] = self.api_key_var.get().strip()
+        os.environ["MEXC_API_SECRET"] = self.api_secret_var.get().strip()
+        os.environ["PYTHONUNBUFFERED"] = "1"
+        os.environ["MEXC_ALLOW_SYMBOLS"] = ",".join(symbols)
+
+        eth_budget = self.trade_eth_budget_var.get().strip()
+        xrp_budget = self.trade_xrp_budget_var.get().strip()
+        eth_trade = self.trade_eth_amount_var.get().strip()
+        xrp_trade = self.trade_xrp_amount_var.get().strip()
+        if eth_budget:
+            os.environ["MEXC_BUDGET_USDT_ETH"] = eth_budget
+        if xrp_budget:
+            os.environ["MEXC_BUDGET_USDT_XRP"] = xrp_budget
+        if eth_trade:
+            os.environ["MEXC_TRADE_USDT_ETH"] = eth_trade
+        if xrp_trade:
+            os.environ["MEXC_TRADE_USDT_XRP"] = xrp_trade
+
+        self.trading_stop_event = threading.Event()
+        self._install_trading_log_handler()
+        self.trading_thread = threading.Thread(
+            target=self._run_trading_thread,
+            args=(self.trading_stop_event,),
+            daemon=True,
+        )
+        self.trading_thread.start()
+        self.log_queue.put(f"\u904b\u7528\u3092\u958b\u59cb\u3057\u307e\u3057\u305f\u3002\u5bfe\u8c61={symbols}")
+        self._update_button_states()
+
+    def stop_trading(self):
+        if self.trading_stop_event:
+            self.trading_stop_event.set()
+        self.log_queue.put("\u904b\u7528\u505c\u6b62\u3092\u8981\u6c42\u3057\u307e\u3057\u305f")
+        self._update_button_states()
+
+    def start_backtest(self):
+        if self.backtest_thread and self.backtest_thread.is_alive():
+            self.log_queue.put("\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u306f\u65e2\u306b\u5b9f\u884c\u4e2d\u3067\u3059")
             return
-        
-        self.backtest_active = False
-        self.start_backtest_btn.config(state=tk.NORMAL)
-        self.stop_backtest_btn.config(state=tk.DISABLED)
-        self.log_message("Stopping backtest...")
-    
-    def run_backtest(self, symbols):
-        """Run backtest in background thread"""
+        symbols = []
+        if self.symbol_eth_var.get():
+            symbols.append("ETHUSDT")
+        if self.symbol_xrp_var.get():
+            symbols.append("XRPUSDT")
+        if not symbols:
+            self.log_queue.put("\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u5bfe\u8c61\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044")
+            return
         try:
-            client = MexcSpotClient("", "")
-            period_years = int(self.period_var.get())
-            
-            for symbol in symbols:
-                if not self.backtest_active:
-                    break
-                
-                self.log_message(f"Backtesting {symbol}...")
-                
-                # Create wallet
-                wallet = SpotWallet(initial_usdt=Decimal("1000"))
-                initial_value = Decimal("1000")
-                
-                # Create strategy
-                if symbol == "ETHUSDT":
-                    strategy = EthMq4Strategy(
-                        client=None,
-                        params=EthMq4Params(
-                            ema_fast=50,
-                            ema_slow=200,
-                            rsi_period=14,
-                            rsi_buy_level=float(self.rsi_buy_var.get()),
-                            rsi_sell_level=float(self.rsi_sell_var.get()),
-                            atr_period=14,
-                            pullback_atr_mult=float(self.pullback_atr_var.get()),
-                            min_trend_strength=float(self.trend_strength_var.get()),
-                            dynamic_atr_enabled=True,
-                            atr_lookback=50,
-                            rsi_upper_limit=52.0,
-                            rsi_exit_overbought=68.0,
-                            price_momentum_periods=3,
-                            min_momentum_pct=0.0,
-                        ),
-                        quote_per_trade=Decimal("50"),
-                    )
-                    interval = "60m"
-                else:  # XRPUSDT
-                    strategy = XrpMq4Strategy(
-                        client=None,
-                        params=XrpMq4Params(),
-                        quote_per_trade=Decimal("40"),
-                    )
-                    interval = "4h"
-                
-                # Fetch data
-                needed_candles = (24 * 365 * period_years) if interval == "60m" else (6 * 365 * period_years)
-                self.log_message(f"Fetching {needed_candles} candles for {symbol}...")
-                klines = fetch_klines(client, symbol, interval, limit=5000, max_candles=needed_candles + 500)
-                
-                if len(klines) < 300:
-                    self.log_message(f"Not enough data for {symbol}, skipping")
+            years = int(self.years_var.get().strip())
+        except ValueError:
+            self.log_queue.put("\u671f\u9593(\u5e74)\u304c\u6570\u5024\u3067\u306f\u3042\u308a\u307e\u305b\u3093")
+            return
+
+        self.bt_graph.clear()
+        for symbol in symbols:
+            self.bt_graph.set_series(symbol, self.bt_series_colors.get(symbol, "#2ca02c"))
+
+        self.backtest_stop_event = threading.Event()
+        self.backtest_thread = threading.Thread(
+            target=self._run_backtest_thread,
+            args=(symbols, years, self.backtest_stop_event),
+            daemon=True,
+        )
+        self.backtest_thread.start()
+        self.log_queue.put(f"\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u3092\u958b\u59cb\u3057\u307e\u3057\u305f\u3002\u671f\u9593={years}\u5e74, \u5bfe\u8c61={symbols}")
+        self._update_button_states()
+
+    def _run_backtest_thread(self, symbols, years, stop_event):
+        def log_fn(message):
+            self.log_queue.put(translate_log_line(message))
+
+        def on_step(symbol, index, ts, close_price, portfolio_value):
+            if stop_event.is_set():
+                return
+            if index % 5 == 0:
+                self.graph_queue.put(("backtest", symbol, index, float(portfolio_value)))
+
+        try:
+            results = run_backtest(
+                symbols=symbols,
+                years=years,
+                on_step=on_step,
+                log_fn=log_fn,
+                stop_event=stop_event,
+            )
+        except Exception as exc:
+            self.log_queue.put(f"\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u5931\u6557: {exc}")
+            self.root.after(0, self._update_button_states)
+            return
+
+        if stop_event.is_set():
+            self.log_queue.put("\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u3092\u505c\u6b62\u3057\u307e\u3057\u305f")
+            self.root.after(0, self._update_button_states)
+            return
+
+        self._update_backtest_results(results)
+        self.root.after(0, self._update_button_states)
+
+    def stop_backtest(self):
+        if self.backtest_stop_event:
+            self.backtest_stop_event.set()
+        self.log_queue.put("\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u505c\u6b62\u3092\u8981\u6c42\u3057\u307e\u3057\u305f")
+        self._update_button_states()
+
+    def _update_backtest_results(self, results):
+        lines = ["\u30d0\u30c3\u30af\u30c6\u30b9\u30c8\u7d50\u679c"]
+        for symbol, data in results.items():
+            lines.append("")
+            lines.append(f"[{symbol}]")
+            lines.append(f"\u6700\u7d42USDT: {data['final_usdt']}")
+            holdings = data.get("base_holdings", {})
+            if isinstance(holdings, dict):
+                holdings_text = ", ".join([f"{k}: {v}" for k, v in holdings.items()]) or "\u306a\u3057"
+            else:
+                holdings_text = str(holdings)
+            lines.append(f"\u4fdd\u6709\u6570\u91cf: {holdings_text}")
+            lines.append(f"\u8cc7\u7523\u5408\u8a08(USDT): {data['portfolio_value']}")
+            lines.append(f"\u5229\u76ca\u7387(%): {data['profit_pct']}")
+            lines.append(f"\u53d6\u5f15\u56de\u6570: {data['trades']}")
+        self._set_results_text("\n".join(lines))
+
+    def _set_results_text(self, text):
+        self.results_text.configure(state="normal")
+        self.results_text.delete("1.0", "end")
+        self.results_text.insert("end", text)
+        self.results_text.configure(state="disabled")
+
+    def _schedule_updates(self):
+        self._refresh_process_state()
+        self._poll_logs()
+        self._poll_graph_updates()
+        self._maybe_update_portfolio()
+        self._update_button_states()
+        self.root.after(100, self._schedule_updates)
+
+    def _refresh_process_state(self):
+        if self.trading_thread and not self.trading_thread.is_alive():
+            self.trading_thread = None
+            self.trading_stop_event = None
+            self._remove_trading_log_handler()
+
+    def _poll_logs(self):
+        while True:
+            try:
+                msg = self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.logs.configure(state="normal")
+            self.logs.insert("end", msg + "\n")
+            self.logs.see("end")
+            self.logs.configure(state="disabled")
+
+    def _poll_graph_updates(self):
+        updated = False
+        while True:
+            try:
+                kind, name, x, y = self.graph_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "backtest":
+                self.bt_graph.add_point(name, x, y)
+                updated = True
+            elif kind == "live":
+                self.op_graph.add_point(name, x, y)
+                updated = True
+        if updated:
+            self.op_graph.redraw()
+            self.bt_graph.redraw()
+
+    def _maybe_update_portfolio(self):
+        now = time.time()
+        if not self.trading_thread or not self.trading_thread.is_alive():
+            return
+        if now - self.last_portfolio_fetch < 30:
+            return
+        self.last_portfolio_fetch = now
+        threading.Thread(target=self._fetch_portfolio_snapshot, daemon=True).start()
+
+    def _fetch_portfolio_snapshot(self):
+        api_key = self.api_key_var.get().strip()
+        api_secret = self.api_secret_var.get().strip()
+        if not api_key or not api_secret:
+            return
+        try:
+            client = MexcSpotClient(api_key, api_secret, base_url=os.getenv("MEXC_BASE_URL") or "https://api.mexc.com")
+            account = client.account()
+            balances = {}
+            for entry in account.get("balances", []):
+                asset = entry.get("asset")
+                if not asset:
                     continue
-                
-                lookback_candles = needed_candles
-                if len(klines) > lookback_candles:
-                    klines = klines[-lookback_candles:]
-                
-                self.log_message(f"Running backtest on {len(klines)} candles...")
-                
-                # Custom backtest loop with progress tracking
-                base = symbol.replace("USDT", "")
-                for i in range(200, len(klines)):
-                    if not self.backtest_active:
-                        break
-                    
-                    window = klines[:i]
-                    candle = klines[i]
-                    ts = candle[0]
-                    close_price = Decimal(candle[4])
-                    
-                    signal = strategy.generate_from_klines(symbol, window)
-                    
-                    if signal and signal.side == "BUY":
-                        usdt_amount = signal.size_quote if signal.size_quote else Decimal("50") if symbol == "ETHUSDT" else Decimal("40")
-                        wallet.buy(symbol, close_price, usdt_amount, ts)
-                        self.log_message(f"[{i}] {symbol} BUY @ {close_price:.4f} | {signal.reason}")
-                    
-                    elif signal and signal.side == "SELL":
-                        holdings_before = wallet.assets.get(base, Decimal("0"))
-                        
-                        if holdings_before > 0:
-                            if symbol == "ETHUSDT":
-                                min_holdings = Decimal("0.15")
-                                min_profit = Decimal("0.15")
-                                
-                                if holdings_before >= min_holdings and wallet.is_profitable(symbol, close_price, min_profit):
-                                    sell_pct = Decimal("0.15")
-                                    wallet.sell_partial(symbol, close_price, sell_pct, ts)
-                                    avg_cost = wallet.get_avg_cost(symbol)
-                                    profit_pct = (close_price - avg_cost) / avg_cost * Decimal("100") if avg_cost > 0 else Decimal("0")
-                                    self.log_message(f"[{i}] {symbol} SELL {float(sell_pct)*100:.0f}% @ {close_price:.4f} | Profit: {profit_pct:.1f}%")
-                            else:
-                                sell_pct = Decimal("0.5")
-                                wallet.sell_partial(symbol, close_price, sell_pct, ts)
-                                self.log_message(f"[{i}] {symbol} SELL {float(sell_pct)*100:.0f}% @ {close_price:.4f}")
-                    
-                    # Update graph every 50 candles
-                    if i % 50 == 0:
-                        base_qty = wallet.assets.get(base, Decimal("0"))
-                        portfolio_value = wallet.usdt + base_qty * close_price
-                        profit_pct = float((portfolio_value / initial_value - Decimal("1")) * Decimal("100"))
-                        
-                        self.backtest_data['time'].append(i)
-                        self.backtest_data['portfolio_value'].append(float(portfolio_value))
-                        self.backtest_data['profit_pct'].append(profit_pct)
-                        
-                        self.root.after(0, self.update_graph)
-                
-                # Final results
-                last_close = Decimal(klines[-1][4])
-                base = symbol.replace("USDT", "")
-                base_qty = wallet.assets.get(base, Decimal("0"))
-                portfolio_value = wallet.usdt + base_qty * last_close
-                profit_pct = float((portfolio_value / initial_value - Decimal("1")) * Decimal("100"))
-                
-                self.log_message(f"{symbol} Backtest Complete:")
-                self.log_message(f"  Final Value: ${float(portfolio_value):.2f}")
-                self.log_message(f"  Profit: {profit_pct:.2f}%")
-                self.log_message(f"  Trades: {len(wallet.trades)}")
-            
-            self.log_message("Backtest completed")
-            self.backtest_active = False
-            self.root.after(0, lambda: self.start_backtest_btn.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.stop_backtest_btn.config(state=tk.DISABLED))
-            
-        except Exception as e:
-            self.log_message(f"Backtest error: {str(e)}")
-            import traceback
-            self.log_message(traceback.format_exc())
-            self.backtest_active = False
-            self.root.after(0, lambda: self.start_backtest_btn.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.stop_backtest_btn.config(state=tk.DISABLED))
+                free = Decimal(str(entry.get("free", "0")))
+                locked = Decimal(str(entry.get("locked", "0")))
+                total = free + locked
+                if total > 0:
+                    balances[asset] = total
+
+            base_assets = [s.replace("USDT", "") for s in self.allow_symbols if s.endswith("USDT")]
+            total_value = Decimal("0")
+            lines = ["\u4fdd\u6709\u72b6\u6cc1 (\u904b\u7528)"]
+            usdt = balances.get("USDT", Decimal("0"))
+            total_value += usdt
+            lines.append(f"USDT \u6b8b\u9ad8: {usdt}")
+
+            cost_tracker = None
+            cost_file = Path("cost_basis.json")
+            if cost_file.exists():
+                cost_tracker = CostBasisTracker(state_file=str(cost_file))
+
+            for base in base_assets:
+                qty = balances.get(base, Decimal("0"))
+                if qty <= 0:
+                    continue
+                symbol = f"{base}USDT"
+                ticker = client.book_ticker(symbol)
+                price = Decimal(str(ticker.get("bidPrice", "0")))
+                value = qty * price
+                total_value += value
+                line = f"{base}: {qty} / \u4fa1\u683c {price} / \u8a55\u4fa1 {value}"
+                if cost_tracker:
+                    avg_cost = cost_tracker.get_avg_cost(symbol)
+                    if avg_cost and avg_cost > 0:
+                        profit_pct = (price - avg_cost) / avg_cost * Decimal("100")
+                        line += f" / \u640d\u76ca {profit_pct:.2f}%"
+                lines.append(line)
+
+            lines.append(f"\u8cc7\u7523\u5408\u8a08(USDT): {total_value}")
+            self.live_x += 1
+            self.graph_queue.put(("live", "\u6b8b\u9ad8", self.live_x, float(total_value)))
+            self._set_results_text("\n".join(lines))
+        except (InvalidOperation, KeyError, ValueError) as exc:
+            self.log_queue.put(f"\u6b8b\u9ad8\u53d6\u5f97\u5931\u6557: {exc}")
+        except Exception as exc:
+            self.log_queue.put(f"\u6b8b\u9ad8\u53d6\u5f97\u5931\u6557: {exc}")
+
+    def clear_logs(self):
+        self.logs.configure(state="normal")
+        self.logs.delete("1.0", "end")
+        self.logs.configure(state="disabled")
+        self.log_queue.put("\u30ed\u30b0\u3092\u30af\u30ea\u30a2\u3057\u307e\u3057\u305f")
+
+    def on_exit(self):
+        self.stop_trading()
+        self.stop_backtest()
+        self.root.destroy()
+
+    def _update_button_states(self):
+        trading_running = self.trading_thread is not None and self.trading_thread.is_alive()
+        backtest_running = self.backtest_thread is not None and self.backtest_thread.is_alive()
+
+        if trading_running:
+            self.btn_start_trading.configure(state="disabled")
+            self.btn_stop_trading.configure(state="normal")
+        else:
+            self.btn_start_trading.configure(state="normal")
+            self.btn_stop_trading.configure(state="disabled")
+
+        if backtest_running:
+            self.btn_start_backtest.configure(state="disabled")
+            self.btn_stop_backtest.configure(state="normal")
+        else:
+            self.btn_start_backtest.configure(state="normal")
+            self.btn_stop_backtest.configure(state="disabled")
+
+    def _register_notebook(self, notebook):
+        style_name = f"CustomNotebook{self._tab_style_counter}.TNotebook"
+        tab_style = f"{style_name}.Tab"
+        self._tab_style_counter += 1
+        notebook.configure(style=style_name)
+        self._style.layout(
+            tab_style,
+            [
+                ("Notebook.tab", {"sticky": "nswe", "children": [
+                    ("Notebook.padding", {"sticky": "nswe", "children": [
+                        ("Notebook.label", {"sticky": "nswe"})
+                    ]})
+                ]})
+            ],
+        )
+
+        def _resize_tabs(event):
+            count = notebook.index("end")
+            if count <= 0:
+                return
+            width_px = max(1, event.width)
+            char_w = max(1, self._tab_font.measure("0"))
+            tab_px = max(1, width_px // count)
+            width_chars = max(6, int(tab_px / char_w) - 1)
+            self._style.configure(tab_style, width=width_chars, anchor="center")
+
+        notebook.bind("<Configure>", _resize_tabs)
+
+    def _run_trading_thread(self, stop_event):
+        try:
+            run_trading(config=str(DEFAULT_CONFIG_PATH), dry_run=False, stop_event=stop_event)
+        except Exception as exc:
+            self.log_queue.put(f"\u904b\u7528\u5931\u6557: {exc}")
+        finally:
+            self.log_queue.put("\u904b\u7528\u304c\u7d42\u4e86\u3057\u307e\u3057\u305f")
+
+    def _install_trading_log_handler(self):
+        if self.trading_log_handler is not None:
+            return
+        handler = _GuiLogHandler(self.log_queue)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logging.getLogger().addHandler(handler)
+        self.trading_log_handler = handler
+
+    def _remove_trading_log_handler(self):
+        if self.trading_log_handler is None:
+            return
+        logging.getLogger().removeHandler(self.trading_log_handler)
+        self.trading_log_handler = None
+
+
+class _GuiLogHandler(logging.Handler):
+    def __init__(self, log_queue):
+        super().__init__()
+        self.log_queue = log_queue
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.log_queue.put(translate_log_line(msg))
+        except Exception:
+            pass
 
 
 def main():
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     root = tk.Tk()
-    app = TradingBotGUI(root)
+    app = MexcGuiApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_exit)
     root.mainloop()
 
 

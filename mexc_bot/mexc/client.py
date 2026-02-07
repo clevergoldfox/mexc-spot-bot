@@ -1,5 +1,6 @@
 import time
 import logging
+import json
 import requests
 
 from ..core.rate_limit import SimpleRateLimiter
@@ -18,6 +19,24 @@ class MexcSpotClient:
         self.http_debug = http_debug
         self.session = requests.Session()
         self.rl = SimpleRateLimiter(0.05)
+        self._time_offset_ms = 0
+        self._last_time_sync = 0.0
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000) + self._time_offset_ms
+
+    def _sync_time(self) -> None:
+        # Keep offset fresh but avoid spamming the time endpoint.
+        now = time.time()
+        if now - self._last_time_sync < 30:
+            return
+        try:
+            server = self.server_time()
+            if isinstance(server, dict) and "serverTime" in server:
+                self._time_offset_ms = int(server["serverTime"]) - int(time.time() * 1000)
+                self._last_time_sync = now
+        except Exception:
+            pass
 
     def _url(self, path: str) -> str:
         return self.base_url + path
@@ -28,29 +47,56 @@ class MexcSpotClient:
         headers = {"Content-Type": "application/json"}
 
         if signed:
-            ts = int(time.time() * 1000)
+            self._sync_time()
+            ts = self._now_ms()
             params, signed_headers = build_signed_params(self.api_key, self.api_secret, params, self.recv_window, ts)
             headers.update(signed_headers)
 
         if self.http_debug:
             log.info("%s %s params=%s signed=%s", method, path, params, signed)
 
-        resp = self.session.request(
-            method,
-            self._url(path),
-            params=params if method in ("GET", "DELETE") else None,
-            data=None if method in ("GET", "DELETE") else params,
-            headers=headers,
-            timeout=60
-        )
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = self.session.request(
+                    method,
+                    self._url(path),
+                    params=params if method in ("GET", "DELETE") else None,
+                    data=None if method in ("GET", "DELETE") else params,
+                    headers=headers,
+                    timeout=60
+                )
 
-        if resp.status_code >= 400:
-            raise HttpError(resp.status_code, resp.text, payload={"path": path, "params": params})
+                if resp.status_code >= 400:
+                    # If server says timestamp is outside recvWindow, resync time once and retry.
+                    if signed and resp.status_code == 400:
+                        try:
+                            payload = json.loads(resp.text)
+                        except Exception:
+                            payload = {}
+                        if payload.get("code") == 700003 or "recvWindow" in str(payload.get("msg", "")):
+                            self._last_time_sync = 0.0
+                            self._sync_time()
+                            ts = self._now_ms()
+                            params, signed_headers = build_signed_params(
+                                self.api_key, self.api_secret, params, self.recv_window, ts
+                            )
+                            headers.update(signed_headers)
+                            continue
+                    if resp.status_code in (502, 503, 504):
+                        time.sleep(1 + attempt * 2)
+                        continue
+                    raise HttpError(resp.status_code, resp.text, payload={"path": path, "params": params})
 
-        try:
-            return resp.json()
-        except Exception:
-            return resp.text
+                try:
+                    return resp.json()
+                except Exception:
+                    return resp.text
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_error = exc
+                # small backoff then retry
+                time.sleep(1 + attempt)
+        raise last_error
 
     # Public
     def ping(self):
