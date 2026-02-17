@@ -9,3 +9,6 @@ class Portfolio:
 
     def asset_free(self, asset: str) -> Decimal:
         return self.free.get(asset, Decimal("0"))
+
+    def asset_locked(self, asset: str) -> Decimal:
+        return self.locked.get(asset, Decimal("0"))

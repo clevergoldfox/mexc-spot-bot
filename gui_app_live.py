@@ -9,19 +9,23 @@ from decimal import Decimal, InvalidOperation
 import tkinter as tk
 from tkinter import ttk
 from tkinter import scrolledtext
+from tkinter import messagebox
 import tkinter.font as tkfont
 
+import json
 import yaml
 from dotenv import dotenv_values, load_dotenv
 
 from mexc_bot.mexc.client import MexcSpotClient
 from mexc_bot.services.cost_basis import CostBasisTracker
+from mexc_bot.services.execution import ExecutionService, ExecutionConfig
+from mexc_bot.core.exceptions import HttpError
 from mexc_bot.cli import run as run_trading
 
 
 ENV_PATH = Path(".env")
 DEFAULT_CONFIG_PATH = Path("config.yaml")
-DEFAULT_SYMBOLS = ["ETHUSDT", "XRPUSDT"]
+DEFAULT_SYMBOLS = ["ETHUSDC", "XRPUSDT"]
 
 
 def load_env():
@@ -321,6 +325,8 @@ class MexcLiveApp:
         ttk.Label(config_frame, text=str(DEFAULT_CONFIG_PATH)).grid(row=0, column=1, sticky="w")
         ttk.Button(config_frame, text="\u8a2d\u5b9a\u8aad\u8fbc", command=self.load_config).grid(row=0, column=2, padx=(12, 6))
         ttk.Button(config_frame, text="\u8a2d\u5b9a\u4fdd\u5b58", command=self.save_config).grid(row=0, column=3)
+        ttk.Button(config_frame, text="\u30c6\u30b9\u30c8\u6ce8\u6587(1\u56de)", command=self.test_order_once).grid(row=0, column=4, padx=(12, 0))
+        ttk.Button(config_frame, text="API\u5bfe\u5fdc\u4e00\u89a7", command=self.show_api_symbols).grid(row=0, column=5, padx=(12, 0))
 
     def _build_monitor_tab(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -366,6 +372,27 @@ class MexcLiveApp:
         load_env()
         self.log_queue.put(".env \u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f")
 
+    def _load_config_values(self):
+        if not DEFAULT_CONFIG_PATH.exists():
+            return Decimal("0"), Decimal("0"), False
+        try:
+            data = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return Decimal("0"), Decimal("0"), False
+        safety = data.get("safety", {}) if isinstance(data, dict) else {}
+        min_usdt = safety.get("min_usdt_per_order", 0)
+        max_usdt = safety.get("max_usdt_per_order", 0)
+        dry_run = bool(safety.get("dry_run_default", False))
+        try:
+            min_usdt = Decimal(str(min_usdt))
+        except Exception:
+            min_usdt = Decimal("0")
+        try:
+            max_usdt = Decimal(str(max_usdt))
+        except Exception:
+            max_usdt = Decimal("0")
+        return min_usdt, max_usdt, dry_run
+
     def load_config(self):
         if not DEFAULT_CONFIG_PATH.exists():
             self.log_queue.put("\u8a2d\u5b9a\u30d5\u30a1\u30a4\u30eb\u304c\u3042\u308a\u307e\u305b\u3093")
@@ -379,7 +406,7 @@ class MexcLiveApp:
         safety = data.get("safety", {}) if isinstance(data, dict) else {}
         trading = data.get("trading", {}) if isinstance(data, dict) else {}
         symbols = trading.get("symbols", [])
-        self.trade_eth_var.set("ETHUSDT" in symbols or "ETH" in symbols)
+        self.trade_eth_var.set("ETHUSDC" in symbols or "ETH" in symbols)
         self.trade_xrp_var.set("XRPUSDT" in symbols or "XRP" in symbols)
 
         max_usdt = _safe_decimal_text(safety.get("max_usdt_per_order"), self.trade_eth_budget_var.get())
@@ -401,7 +428,7 @@ class MexcLiveApp:
 
         symbols = []
         if self.trade_eth_var.get():
-            symbols.append("ETHUSDT")
+            symbols.append("ETHUSDC")
         if self.trade_xrp_var.get():
             symbols.append("XRPUSDT")
         if not symbols:
@@ -439,13 +466,220 @@ class MexcLiveApp:
 
         self.log_queue.put("\u8a2d\u5b9a\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f")
 
+    def test_order_once(self):
+        if self.trading_thread and self.trading_thread.is_alive():
+            self.log_queue.put("\u904b\u7528\u4e2d\u306f\u30c6\u30b9\u30c8\u6ce8\u6587\u3092\u884c\u3048\u307e\u305b\u3093")
+            return
+        api_key = self.api_key_var.get().strip()
+        api_secret = self.api_secret_var.get().strip()
+        if not api_key or not api_secret:
+            self.log_queue.put("API\u30ad\u30fc/\u30b7\u30fc\u30af\u30ec\u30c3\u30c8\u3092\u8a2d\u5b9a\u3057\u3066\u304f\u3060\u3055\u3044")
+            return
+
+        symbol = None
+        amount_text = None
+        if self.trade_eth_var.get():
+            symbol = "ETHUSDC"
+            amount_text = self.trade_eth_amount_var.get().strip()
+        elif self.trade_xrp_var.get():
+            symbol = "XRPUSDT"
+            amount_text = self.trade_xrp_amount_var.get().strip()
+        else:
+            self.log_queue.put("\u30c6\u30b9\u30c8\u5bfe\u8c61\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044")
+            return
+
+        try:
+            quote_qty = Decimal(amount_text)
+        except Exception:
+            self.log_queue.put("\u30c6\u30b9\u30c8\u6ce8\u6587\u91d1\u984d\u304c\u4e0d\u6b63\u3067\u3059")
+            return
+
+        min_usdt, max_usdt, dry_run = self._load_config_values()
+        if min_usdt > 0 and quote_qty < min_usdt:
+            self.log_queue.put(f"\u30c6\u30b9\u30c8\u6ce8\u6587\u306f\u6700\u4f4e {min_usdt} USDT \u4ee5\u4e0a\u3067\u3059")
+            return
+        if max_usdt > 0 and quote_qty > max_usdt:
+            self.log_queue.put(f"\u30c6\u30b9\u30c8\u6ce8\u6587\u306f\u6700\u5927 {max_usdt} USDT \u4ee5\u4e0b\u3067\u3059")
+            return
+
+        if dry_run:
+            self.log_queue.put("\u8b66\u544a: config.yaml \u306e dry_run_default \u304c true \u3067\u3059\u3002\u30c6\u30b9\u30c8\u6ce8\u6587\u306f\u5b9f\u969b\u306b\u767a\u6ce8\u3057\u307e\u3059\u3002")
+
+        if not messagebox.askyesno(
+            "\u30c6\u30b9\u30c8\u6ce8\u6587",
+            f"{symbol} \u3092 {quote_qty} USDT \u3067\u6210\u884c\u8cb7\u3044\u3057\u307e\u3059\u3002\u5b9f\u884c\u3057\u307e\u3059\u304b?",
+        ):
+            return
+
+        try:
+            client = MexcSpotClient(api_key, api_secret, base_url=os.getenv("MEXC_BASE_URL") or "https://api.mexc.com")
+            if not self._is_symbol_api_tradable(client, symbol):
+                self.log_queue.put(f"{symbol} \u306fAPI\u53d6\u5f15\u306b\u5bfe\u5fdc\u3057\u3066\u3044\u307e\u305b\u3093")
+                return
+            execsvc = ExecutionService(client, ExecutionConfig(), dry_run=False)
+            try:
+                result = execsvc.market_buy_quote(symbol, quote_qty)
+                self.log_queue.put(f"\u30c6\u30b9\u30c8\u6ce8\u6587\u7d50\u679c: {result}")
+            except HttpError as exc:
+                # Fallback for symbols that do not accept quoteOrderQty (code 30041)
+                msg = str(exc)
+                if "code\":30041" in msg or "\"code\":30041" in msg or "code\": 30041" in msg:
+                    # Fallback to LIMIT when MARKET is not allowed for this symbol.
+                    ticker = client.book_ticker(symbol)
+                    price = Decimal(str(ticker.get("askPrice", "0") or ticker.get("bidPrice", "0")))
+                    if price <= 0:
+                        self.log_queue.put("\u30c6\u30b9\u30c8\u6ce8\u6587\u5931\u6557: \u7121\u52b9\u306a\u4fa1\u683c")
+                        return
+                    min_notional = self._get_min_notional(client, symbol)
+                    if min_notional is not None and quote_qty < min_notional:
+                        self.log_queue.put(
+                            f"\u30c6\u30b9\u30c8\u6ce8\u6587\u5931\u6557: \u6700\u4f4e\u6ce8\u6587\u91d1\u984d\u306f {min_notional} \u3067\u3059"
+                        )
+                        self._log_symbol_filters(client, symbol)
+                        return
+                    raw_qty = quote_qty / price
+                    qty = self._adjust_quantity(client, symbol, raw_qty)
+                    qty = qty.quantize(Decimal("0.0001"))
+                    if qty <= 0:
+                        self.log_queue.put("\u30c6\u30b9\u30c8\u6ce8\u6587\u5931\u6557: \u6570\u91cf\u304c\u6700\u5c0f\u8a31\u53ef\u3092\u4e0b\u56de\u308a\u307e\u3057\u305f")
+                        return
+                    result = client.place_order(
+                        symbol=symbol,
+                        side="BUY",
+                        type="LIMIT",
+                        timeInForce="GTC",
+                        quantity=str(qty),
+                        price=str(price),
+                    )
+                    self.log_queue.put(f"\u30c6\u30b9\u30c8\u6ce8\u6587\u518d\u8a66\u884c(LIMIT): {result}")
+                else:
+                    raise
+        except Exception as exc:
+            self.log_queue.put(f"\u30c6\u30b9\u30c8\u6ce8\u6587\u5931\u6557: {exc}")
+
+    def show_api_symbols(self):
+        api_key = self.api_key_var.get().strip()
+        api_secret = self.api_secret_var.get().strip()
+        if not api_key or not api_secret:
+            self.log_queue.put("API\u30ad\u30fc/\u30b7\u30fc\u30af\u30ec\u30c3\u30c8\u3092\u8a2d\u5b9a\u3057\u3066\u304f\u3060\u3055\u3044")
+            return
+        try:
+            client = MexcSpotClient(api_key, api_secret, base_url=os.getenv("MEXC_BASE_URL") or "https://api.mexc.com")
+            info = client.exchange_info()
+            symbols = info.get("symbols", []) if isinstance(info, dict) else []
+            tradable = []
+            for item in symbols:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("isSpotTradingAllowed"):
+                    sym = item.get("symbol")
+                    if sym:
+                        tradable.append(sym)
+            if not tradable:
+                self.log_queue.put("API\u53d6\u5f15\u53ef\u80fd\u306a\u30b7\u30f3\u30dc\u30eb\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093")
+                return
+            tradable.sort()
+            sample = ", ".join(tradable[:30])
+            self.log_queue.put(f"API\u53d6\u5f15\u53ef\u80fd\u6570: {len(tradable)} / \u4f8b: {sample}")
+            self._show_text_window("API\u5bfe\u5fdc\u30b7\u30f3\u30dc\u30eb\u4e00\u89a7", "\n".join(tradable))
+        except Exception as exc:
+            self.log_queue.put(f"API\u30b7\u30f3\u30dc\u30eb\u53d6\u5f97\u5931\u6557: {exc}")
+
+    def _show_text_window(self, title: str, text: str):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("720x520")
+        win.transient(self.root)
+        win.grab_set()
+        box = scrolledtext.ScrolledText(win, wrap="word", state="normal")
+        box.insert("end", text)
+        box.configure(state="disabled")
+        box.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def _is_symbol_api_tradable(self, client: MexcSpotClient, symbol: str) -> bool:
+        try:
+            info = client.exchange_info(symbol=symbol)
+            symbols = info.get("symbols", []) if isinstance(info, dict) else []
+            if not symbols:
+                return False
+            data = symbols[0] if isinstance(symbols, list) else symbols
+            flag = data.get("isSpotTradingAllowed")
+            if flag is None:
+                # Fallbacks for other response shapes
+                flag = data.get("isSpotTradingAllowed".lower()) or data.get("isSpotTradingAllowed".upper())
+            return bool(flag)
+        except Exception:
+            return False
+
+    def _adjust_quantity(self, client: MexcSpotClient, symbol: str, qty: Decimal) -> Decimal:
+        try:
+            info = client.exchange_info(symbol=symbol)
+            symbols = info.get("symbols", []) if isinstance(info, dict) else []
+            if not symbols:
+                return Decimal("0")
+            data = symbols[0]
+            filters = data.get("filters", []) if isinstance(data, dict) else []
+            step = None
+            min_qty = None
+            # Prefer MARKET_LOT_SIZE for market orders, fallback to LOT_SIZE.
+            for f in filters:
+                if f.get("filterType") == "MARKET_LOT_SIZE":
+                    step = Decimal(str(f.get("stepSize", "0")))
+                    min_qty = Decimal(str(f.get("minQty", "0")))
+                    break
+            if step is None:
+                for f in filters:
+                    if f.get("filterType") == "LOT_SIZE":
+                        step = Decimal(str(f.get("stepSize", "0")))
+                        min_qty = Decimal(str(f.get("minQty", "0")))
+                        break
+            if step is None or step <= 0:
+                return qty
+            # Round down to step size
+            steps = (qty / step).to_integral_value(rounding="ROUND_FLOOR")
+            adj = steps * step
+            if min_qty is not None and adj < min_qty:
+                return Decimal("0")
+            return adj
+        except Exception:
+            return qty
+
+    def _get_min_notional(self, client: MexcSpotClient, symbol: str) -> Decimal | None:
+        try:
+            info = client.exchange_info(symbol=symbol)
+            symbols = info.get("symbols", []) if isinstance(info, dict) else []
+            if not symbols:
+                return None
+            data = symbols[0]
+            filters = data.get("filters", []) if isinstance(data, dict) else []
+            for f in filters:
+                if f.get("filterType") in ("MIN_NOTIONAL", "MIN_NOTIONAL_VALUE", "NOTIONAL"):
+                    value = f.get("minNotional") or f.get("notional") or f.get("minNotionalValue")
+                    if value is not None:
+                        return Decimal(str(value))
+            return None
+        except Exception:
+            return None
+
+    def _log_symbol_filters(self, client: MexcSpotClient, symbol: str):
+        try:
+            info = client.exchange_info(symbol=symbol)
+            symbols = info.get("symbols", []) if isinstance(info, dict) else []
+            if not symbols:
+                return
+            data = symbols[0]
+            filters = data.get("filters", []) if isinstance(data, dict) else []
+            self.log_queue.put(f"{symbol} filters: {filters}")
+        except Exception:
+            pass
+
     def start_trading(self):
         if self.trading_thread and self.trading_thread.is_alive():
             self.log_queue.put("\u904b\u7528\u306f\u65e2\u306b\u5b9f\u884c\u4e2d\u3067\u3059")
             return
         symbols = []
         if self.trade_eth_var.get():
-            symbols.append("ETHUSDT")
+            symbols.append("ETHUSDC")
         if self.trade_xrp_var.get():
             symbols.append("XRPUSDT")
         if not symbols:
