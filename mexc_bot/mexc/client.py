@@ -38,17 +38,28 @@ class MexcSpotClient:
         except Exception:
             pass
 
+    def _get_server_time(self) -> int | None:
+        try:
+            resp = requests.get(self._url("/api/v3/time"), timeout=5)
+            data = resp.json()
+            return int(data.get("serverTime"))
+        except Exception:
+            return None
+
     def _url(self, path: str) -> str:
         return self.base_url + path
 
     def _request(self, method: str, path: str, params=None, signed: bool = False):
         self.rl.wait()
         params = params or {}
-        headers = {"Content-Type": "application/json"}
+        headers = {}
 
         if signed:
-            self._sync_time()
-            ts = self._now_ms()
+            # Always use MEXC server time for signed requests.
+            ts = self._get_server_time()
+            if ts is None:
+                self._sync_time()
+                ts = self._now_ms()
             params, signed_headers = build_signed_params(self.api_key, self.api_secret, params, self.recv_window, ts)
             headers.update(signed_headers)
 
@@ -61,8 +72,8 @@ class MexcSpotClient:
                 resp = self.session.request(
                     method,
                     self._url(path),
-                    params=params if method in ("GET", "DELETE") else None,
-                    data=None if method in ("GET", "DELETE") else params,
+                    params=params,
+                    data=None,
                     headers=headers,
                     timeout=60
                 )
